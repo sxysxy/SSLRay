@@ -629,11 +629,12 @@ impl App {
                 ui.label(notice.display(lang));
             }
             ui.add_space(10.0);
-            ui.add(
-                egui::TextEdit::singleline(&mut self.password)
-                    .password(true)
-                    .hint_text(text(lang, T::PasswordHint))
-                    .desired_width(f32::INFINITY),
+            password_edit(
+                ui,
+                &mut self.password,
+                &mut self.show_password,
+                lang,
+                egui::Margin::symmetric(4, 2),
             );
             ui.add_space(10.0);
             self.password_storage_option(ui);
@@ -659,8 +660,10 @@ impl App {
         if cancel || response.should_close() {
             self.password_dialog = false;
             self.password.zeroize();
+            self.show_password = false;
         } else if submit {
             self.password_dialog = false;
+            self.show_password = false;
             self.connect();
         }
     }
@@ -885,6 +888,7 @@ impl App {
         if self.busy() {
             return;
         }
+        self.show_password = false;
         self.apply_routes();
         if self.profile.protocol != VpnProtocol::OpenVpn && self.profile.username.trim().is_empty()
         {
@@ -1299,17 +1303,15 @@ impl App {
                             .margin(Vec2::new(10.0, 10.0)),
                     );
                     field_label(&mut cols[1], text(lang, T::Password));
-                    cols[1].add(
-                        egui::TextEdit::singleline(&mut self.password)
-                            .password(!self.show_password)
-                            .desired_width(f32::INFINITY)
-                            .hint_text(text(lang, T::PasswordHint))
-                            .margin(Vec2::new(10.0, 10.0)),
+                    password_edit(
+                        &mut cols[1],
+                        &mut self.password,
+                        &mut self.show_password,
+                        lang,
+                        egui::Margin::symmetric(10, 10),
                     );
                     cols[1].add_space(7.0);
                     self.password_storage_option(&mut cols[1]);
-                    cols[1].add_space(5.0);
-                    cols[1].checkbox(&mut self.show_password, text(lang, T::ShowPassword));
                 });
                 ui.add_space(12.0);
                 ui.separator();
@@ -1350,43 +1352,40 @@ impl App {
             self.profile.openvpn_config.clone(),
             self.profile.username.clone(),
         );
-        ui.horizontal(|ui| {
+        let action_size = Vec2::new(100.0, 32.0);
+        action_row(ui, |ui| {
             ui.label(
                 RichText::new(text(lang, T::ConnectionProfile))
                     .size(16.0)
                     .strong(),
             );
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(
-                        !self.busy(),
-                        egui::Button::new(text(lang, T::SaveProfile))
-                            .corner_radius(7)
-                            .min_size(Vec2::new(100.0, 32.0)),
-                    )
-                    .clicked()
-                {
-                    self.notice = Some(match self.save() {
-                        Ok(()) => Notice::plain(T::ProfileSaved),
-                        Err(error) => Notice::error(T::SaveFailed, format!("{error:#}")),
-                    });
-                }
-                ui.add_space(8.0);
-                if ui
-                    .add_enabled(
-                        !self.busy(),
-                        egui::Button::new(
-                            RichText::new(text(lang, T::Connect)).color(Color32::WHITE),
-                        )
+            if ui
+                .add_enabled(
+                    !self.busy(),
+                    egui::Button::new(text(lang, T::SaveProfile))
+                        .corner_radius(7)
+                        .min_size(action_size),
+                )
+                .clicked()
+            {
+                self.notice = Some(match self.save() {
+                    Ok(()) => Notice::plain(T::ProfileSaved),
+                    Err(error) => Notice::error(T::SaveFailed, format!("{error:#}")),
+                });
+            }
+            ui.add_space(8.0);
+            if ui
+                .add_enabled(
+                    !self.busy(),
+                    egui::Button::new(RichText::new(text(lang, T::Connect)).color(Color32::WHITE))
                         .fill(colors.blue)
                         .corner_radius(7)
-                        .min_size(Vec2::new(100.0, 32.0)),
-                    )
-                    .clicked()
-                {
-                    self.connect();
-                }
-            });
+                        .min_size(action_size),
+                )
+                .clicked()
+            {
+                self.connect();
+            }
         });
         ui.add_space(12.0);
         let busy = self.busy();
@@ -1647,7 +1646,7 @@ impl App {
             });
             ui.add_space(16.0);
             card(ui).show(ui, |ui| {
-                ui.horizontal(|ui| {
+                action_row(ui, |ui| {
                     ui.label(RichText::new(text(lang, T::Routing)).size(14.0).strong());
                     ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                         ui.label("MTU");
@@ -1817,7 +1816,7 @@ impl App {
     fn logs(&mut self, ui: &mut egui::Ui) {
         let colors = palette(ui);
         let lang = self.language;
-        ui.horizontal(|ui| {
+        action_row(ui, |ui| {
             ui.label(
                 RichText::new(text(lang, T::SessionEvents))
                     .size(16.0)
@@ -1946,7 +1945,7 @@ impl App {
         ui.add_space(16.0);
         card(ui).show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            ui.horizontal(|ui| {
+            action_row(ui, |ui| {
                 ui.label(
                     RichText::new(text(lang, T::AdapterInfo))
                         .size(16.0)
@@ -2476,6 +2475,22 @@ fn apply_theme(ctx: &egui::Context, theme: Theme) {
     }));
 }
 
+fn action_row<R>(
+    ui: &mut egui::Ui,
+    contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::InnerResponse<R> {
+    // Reserve the button height before painting the title; a later, taller
+    // widget cannot recenter a label that has already been laid out.
+    let height = 32.0_f32
+        .max(ui.spacing().interact_size.y)
+        .max(ui.text_style_height(&egui::TextStyle::Button) + ui.spacing().button_padding.y * 2.0);
+    ui.allocate_ui_with_layout(
+        Vec2::new(ui.available_width(), height),
+        egui::Layout::left_to_right(Align::Center),
+        contents,
+    )
+}
+
 fn card(ui: &egui::Ui) -> egui::Frame {
     let colors = palette(ui);
     egui::Frame::new()
@@ -2528,6 +2543,83 @@ fn logo(ui: &mut egui::Ui, size: f32, color: Color32) {
         Stroke::NONE,
     ));
 }
+/// Keep the text edit's native frame and focus behavior, reserving space for an
+/// independent, keyboard-accessible visibility button inside its right edge.
+fn password_edit(
+    ui: &mut egui::Ui,
+    password: &mut String,
+    visible: &mut bool,
+    language: Language,
+    mut margin: egui::Margin,
+) -> egui::Response {
+    margin.right += 32;
+    let response = ui.add(
+        egui::TextEdit::singleline(password)
+            .password(!*visible)
+            .hint_text(text(language, T::PasswordHint))
+            .desired_width(f32::INFINITY)
+            .margin(margin),
+    );
+    let button_rect = egui::Rect::from_min_max(
+        egui::pos2(response.rect.right() - 34.0, response.rect.top() + 2.0),
+        response.rect.right_bottom() - Vec2::splat(2.0),
+    );
+    let label = text(
+        language,
+        if *visible {
+            T::HidePassword
+        } else {
+            T::ShowPassword
+        },
+    );
+    let toggle = ui.interact(
+        button_rect,
+        response.id.with("password-visibility"),
+        egui::Sense::click(),
+    );
+    toggle.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
+    });
+    let toggle = toggle.on_hover_text(label);
+    if toggle.clicked() {
+        *visible = !*visible;
+        ui.ctx().request_repaint();
+    }
+    if ui.is_rect_visible(button_rect) {
+        let visuals = ui.style().interact(&toggle);
+        let painter = ui.painter();
+        if toggle.hovered() || toggle.has_focus() || toggle.is_pointer_button_down_on() {
+            painter.rect_filled(button_rect, 4, visuals.weak_bg_fill);
+        }
+        if toggle.has_focus() {
+            painter.rect_stroke(button_rect, 4, visuals.fg_stroke, egui::StrokeKind::Inside);
+        }
+        let center = button_rect.center();
+        let stroke = Stroke::new(1.5, visuals.fg_stroke.color);
+        for direction in [-1.0, 1.0] {
+            painter.add(egui::epaint::CubicBezierShape::from_points_stroke(
+                [
+                    center + Vec2::new(-9.0, 0.0),
+                    center + Vec2::new(-4.5, 6.0 * direction),
+                    center + Vec2::new(4.5, 6.0 * direction),
+                    center + Vec2::new(9.0, 0.0),
+                ],
+                false,
+                Color32::TRANSPARENT,
+                stroke,
+            ));
+        }
+        painter.circle_stroke(center, 2.5, stroke);
+        if !*visible {
+            painter.line_segment(
+                [center + Vec2::new(-8.0, -6.0), center + Vec2::new(8.0, 6.0)],
+                stroke,
+            );
+        }
+    }
+    response
+}
+
 fn bytes(value: u64) -> String {
     if value < 1024 {
         format!("{value} B")

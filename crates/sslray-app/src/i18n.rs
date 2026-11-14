@@ -110,6 +110,7 @@ catalog! {
     PasswordHint => ("输入登录密码", "Enter your password"),
     UseOtp => ("使用第二临时密码 / OTP", "Use a temporary second password / OTP"),
     ShowPassword => ("显示密码", "Show password"),
+    HidePassword => ("隐藏密码", "Hide password"),
     OtpHint => ("本次验证码 / 第二密码", "Current code / second password"),
     OtpSeparate => ("第二密码独立提交，不会拼接到主密码。", "The second password is submitted separately from your password."),
     AutoMode => ("自适应模式", "Adaptive mode"),
