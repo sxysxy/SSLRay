@@ -1,0 +1,5 @@
+FROM alpine:3.20
+RUN apk add --no-cache openvpn openssl iproute2 iptables
+COPY entrypoint.sh /usr/local/bin/sslray-vpn-lab
+RUN chmod 755 /usr/local/bin/sslray-vpn-lab
+ENTRYPOINT ["/usr/local/bin/sslray-vpn-lab"]

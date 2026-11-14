@@ -1,0 +1,18 @@
+services:
+  openvpn:
+    build:
+      context: .
+      dockerfile: Dockerfile.openvpn
+    image: sslray-openvpn-lab:local
+    command: openvpn
+    cap_add: [NET_ADMIN]
+    devices: [/dev/net/tun:/dev/net/tun]
+    ports: ["127.0.0.1:1194:1194/udp"]
+    volumes: ["../../work/openvpn-lab:/state"]
+  ocserv:
+    build: ./ocserv
+    image: sslray-ocserv-lab:local
+    container_name: sslray-ocserv-lab
+    cap_add: [NET_ADMIN]
+    ports: ["127.0.0.1:1443:443/tcp"]
+    volumes: ["../../work/ocserv-lab:/state"]

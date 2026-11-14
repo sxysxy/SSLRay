@@ -1,0 +1,15 @@
+[package]
+name = "vpn-tls"
+version = "0.4.5"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+vpn-core = { path = "../vpn-core" }
+anyhow = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "io-util", "macros"] }
+hex = "0.4"
+ring = "0.17"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+x509-parser = "0.18"

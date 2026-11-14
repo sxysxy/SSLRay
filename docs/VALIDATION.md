@@ -1,0 +1,55 @@
+# 验证状态
+
+文档整理：2026-11-15。最近测试：2026-11-14，macOS Apple Silicon。本次仅调整文档，未重新运行构建或网络测试。
+
+## 自动检查
+
+| 项目 | 最近记录 | 范围 |
+| --- | --- | --- |
+| 工作区回归 | **95 通过、0 失败、4 忽略** | 协议边界、路由事务、证书、OTP、i18n、配置/凭据、helper、适配器 |
+| 参考服务互通 | 前次网络联调 **4 项通过** | OpenVPN 与 ocserv 各 2 项；最近回归未启动容器，未计入 95 项 |
+| 独立 OpenVPN 引擎 | 前次 **18 项通过** | PRF、控制/数据通道、重放、密钥更新、OTP 不复用和算法策略；不计入工作区 |
+| 格式 / Clippy / 开发包 | 通过 | fmt、`clippy -D warnings`、release 构建、`codesign --verify --deep --strict` |
+
+## 网络实测
+
+| 场景 | 已验证结果 | 边界 |
+| --- | --- | --- |
+| 真实网关设备（华为）TLS | 原生认证、8 条下发路由、匹配的 DNS 与 ICMP 回复 | 纯 IP 探测不修改宿主接口、路由或 DNS |
+| 真实网关设备（华为）旧版 UDP | 显式 CHIV3 / AES-128-CBC，收到同目标的匹配 ICMP 回复 | 无逐包 MAC，需主动启用；Auto 保持 TLS |
+| 真实网关设备 TLS / UDP 宿主 SSH | 各经 SSLRay utun 和单目标 `/32`，公钥 SSH 静态命令退出 0；Ctrl-C 后自有接口和路由清理 | 禁用 SSH 代理/复用并严格检查 host key；未安装真实网关设备的全部路由 |
+| OpenVPN 2.6.20 | UDP / AES-256-GCM 证书认证、纯 IP ICMP 往返及错误指纹拒绝；默认 `gateway_only` 经 utun 系统 ping **2/2**，断开清理 | 本地 Docker 参考服务；不代表 TCP/MFA 等其他组合均通过 |
+| ocserv 1.6.0 / GnuTLS 3.8.13 | 密码认证、TLS/CSTP、纯 IP ICMP/DNS 往返及错误指纹拒绝 | 本地参考服务；未测 Cisco 硬件或该协议的宿主路由 |
+| 国密 / OTP | 本地 RFC 8998 握手及应用数据、算法向量、模拟挑战通过 | 未验证真实网关设备的国密或 OTP；详见[国密记录](GM-VALIDATION.md) |
+
+真实网关设备默认下发的八条分流路由的完整系统复验尚未完成验收：最后一次因 macOS 授权等待超时未进入安装阶段。另一个活动 VPN 可重装相同网段路由、改变实际出口，联调应避免并发 VPN 干扰。
+
+## GUI、配置与授权
+
+- 已人工检查：按名称选择/新建 Profile、重启恢复选择、软件设置、浅色/深色、中英文、适配器/IP/MTU、版本、分流路由列表及空手动列表、菜单 Quit。
+- 原生文件框已成功选择 `.ovpn` 并回填路径；密码保存确认框已检查本地路径、云端与泄露提示。
+- 随后的 Base64 格式与保存选项位置调整通过自动回归，未再次人工验收该布局。存储测试覆盖旧明文升级、严格解码、边界与冲突拒绝、0600、配置损坏保护及密码隔离。
+- helper 复用、10 分钟空闲/1 小时授权期限、父进程断开、重叠会话拒绝、授权失败分类和显式重试通过 IPC/状态测试；新复用实现未再次实测系统弹窗次数。
+
+尚待验收：Linux/Windows 运行时、Cisco 宿主网络、真实网关设备全部下发路由/合并策略、IPv4 全隧道、真实 OTP、更多认证组合、长期稳定性，以及崩溃/强退/活跃 GUI 退出等完整清理场景。托盘 Restore 与真实 OTP 弹窗也未完成人工验收。
+
+## 复验入口
+
+在仓库根目录执行；普通测试不连接真实网关设备：
+
+```sh
+cargo fmt --all -- --check
+cargo test --workspace --all-targets --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo run -p sslray -- capabilities
+cargo test -p sslray-core --test gm_tls -- --nocapture
+```
+
+`gm_tls` 在后端不支持时会输出跳过原因；仅看到 `ok` 不能证明国密握手成功。服务准备好后再执行实际互通测试：
+
+```sh
+cargo test -p sslray-core --test openvpn_interop --locked -- --ignored --test-threads=1
+cargo test -p sslray-core --test cisco_interop --locked -- --ignored --test-threads=1
+```
+
+容器准备及停止方法见 [OpenVPN](OPENVPN.md)、[Cisco](CISCO.md)；实验材料保存在忽略的 `work/`，不作为应用产物。真实网关设备的纯 IP 探测入口为 `sslray-core` 的 `probe_data` 示例；宿主联调用 CLI `connect`，凭据仅通过隐藏输入或显式 stdin 提供。文档、日志和版本库均不应包含密码、OTP、令牌、私钥或未脱敏抓包。
