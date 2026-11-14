@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 30 30">
+  <title>SSLRay</title>
+  <desc>Blue circle and white lightning bolt from the SSLRay sidebar logo.</desc>
+  <circle cx="15" cy="15" r="14.4" fill="#235edd"/>
+  <path d="M16 5 8 17h6v8l8-12h-6Z" fill="#fff"/>
+</svg>

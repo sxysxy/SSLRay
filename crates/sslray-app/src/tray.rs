@@ -165,26 +165,68 @@ impl Tray {
     }
 }
 
+/// Load antialiased artwork rendered from assets/sslray.svg. The tray (32 px)
+/// and window (64 px) use exact-size PNGs; other sizes retain this helper's API.
 pub fn icon_rgba(size: u32) -> Vec<u8> {
-    let mut rgba = Vec::with_capacity((size * size * 4) as usize);
+    if size == 0 {
+        return Vec::new();
+    }
+    assert!(size <= 1024, "Icon size must not exceed the 1024px source");
+    let png: &[u8] = match size {
+        16 => include_bytes!("../../../assets/icons/sslray-16.png"),
+        20 => include_bytes!("../../../assets/icons/sslray-20.png"),
+        24 => include_bytes!("../../../assets/icons/sslray-24.png"),
+        32 => include_bytes!("../../../assets/icons/sslray-32.png"),
+        40 => include_bytes!("../../../assets/icons/sslray-40.png"),
+        48 => include_bytes!("../../../assets/icons/sslray-48.png"),
+        64 => include_bytes!("../../../assets/icons/sslray-64.png"),
+        128 => include_bytes!("../../../assets/icons/sslray-128.png"),
+        256 => include_bytes!("../../../assets/icons/sslray-256.png"),
+        512 => include_bytes!("../../../assets/icons/sslray-512.png"),
+        _ => include_bytes!("../../../assets/icons/sslray-1024.png"),
+    };
+    let icon = eframe::icon_data::from_png_bytes(png).expect("Invalid bundled SSLRay icon PNG");
+    if icon.width == size {
+        return icon.rgba;
+    }
+
+    // Bilinear sampling in premultiplied alpha avoids a dark fringe where the
+    // transparent background meets the blue circle at nonstandard sizes.
+    let mut rgba = vec![0; (size * size * 4) as usize];
+    let scale = icon.width as f32 / size as f32;
     for y in 0..size {
         for x in 0..size {
-            let nx = (x as f32 + 0.5) / size as f32;
-            let ny = (y as f32 + 0.5) / size as f32;
-            let dx = nx - 0.5;
-            let dy = ny - 0.5;
-            let inside = dx * dx + dy * dy <= 0.225;
-            let bolt = ((0.45..0.64).contains(&nx) && (0.20..0.49).contains(&ny))
-                || ((0.32..0.64).contains(&nx) && (0.43..0.57).contains(&ny))
-                || ((0.32..0.51).contains(&nx) && (0.51..0.80).contains(&ny));
-            let color = if inside && bolt {
-                [255, 255, 255, 255]
-            } else if inside {
-                [44, 102, 239, 255]
-            } else {
-                [0, 0, 0, 0]
-            };
-            rgba.extend_from_slice(&color);
+            let sx = ((x as f32 + 0.5) * scale - 0.5).clamp(0.0, (icon.width - 1) as f32);
+            let sy = ((y as f32 + 0.5) * scale - 0.5).clamp(0.0, (icon.height - 1) as f32);
+            let x0 = sx.floor() as u32;
+            let y0 = sy.floor() as u32;
+            let dx = sx - x0 as f32;
+            let dy = sy - y0 as f32;
+            let mut channels = [0.0; 4];
+            for (px, py, weight) in [
+                (x0, y0, (1.0 - dx) * (1.0 - dy)),
+                ((x0 + 1).min(icon.width - 1), y0, dx * (1.0 - dy)),
+                (x0, (y0 + 1).min(icon.height - 1), (1.0 - dx) * dy),
+                (
+                    (x0 + 1).min(icon.width - 1),
+                    (y0 + 1).min(icon.height - 1),
+                    dx * dy,
+                ),
+            ] {
+                let offset = ((py * icon.width + px) * 4) as usize;
+                let alpha = f32::from(icon.rgba[offset + 3]) * weight;
+                channels[3] += alpha;
+                for (channel, value) in channels[..3].iter_mut().enumerate() {
+                    *value += f32::from(icon.rgba[offset + channel]) * alpha;
+                }
+            }
+            let offset = ((y * size + x) * 4) as usize;
+            if channels[3] > 0.0 {
+                for (output, value) in rgba[offset..offset + 3].iter_mut().zip(&channels[..3]) {
+                    *output = (value / channels[3]).round() as u8;
+                }
+            }
+            rgba[offset + 3] = channels[3].round() as u8;
         }
     }
     rgba

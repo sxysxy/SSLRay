@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[build-dependencies]
+# Build scripts execute on the host; this also supports cross-building Windows
+# from macOS/Linux. build.rs invokes the resource compiler only for Windows.
+embed-resource = "3.0"
+
 [dependencies]
 sslray-core = { path = "../sslray-core" }
 anyhow.workspace = true

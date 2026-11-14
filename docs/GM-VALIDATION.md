@@ -7,13 +7,15 @@ Huawei NEM v1 uses AES-256-GCM and legacy CHIV3 uses AES-128-CBC; neither is an 
 ## Detection and reproduction
 
 ```sh
-cargo run -p sslray -- capabilities
-cargo test -p sslray-core --test gm_tls -- --nocapture
+./scripts/cargo-macos.sh run -p sslray -- capabilities
+./scripts/cargo-macos.sh test -p sslray-core --test gm_tls -- --nocapture
 ```
+
+These macOS commands use the pinned project OpenSSL source. On Linux/Windows, use `cargo` with a compatible native backend.
 
 Use the linked library's actual `gm_tls13` capabilities and handshake tests, not its OpenSSL/Tongsuo product name. The integration test uses the VPN's `crypto::connect`, generates temporary SM2/SM3 certificates, and verifies local handshakes, SM2 certificates and application-data round trips for both `TLS_SM4_GCM_SM3` and `TLS_SM4_CCM_SM3`. Unsupported backends report a skip reason; a skipped test is not a successful handshake.
 
-The local environment passed these integration tests with OpenSSL 4.0.2, plus Tongsuo 8.5.0 CLI loopback handshakes for both suites and SM3/SM4 vectors. These results do not establish GM TLS support or a working GM VPN data path on a real gateway device. The full Tongsuo cryptographic test suite was not run. See [VALIDATION.md](VALIDATION.md) for overall validation status.
+On 2026-11-15, the macOS arm64 build passed the integration test for both suites using the project's static OpenSSL 4.0.3 backend, compiled with a macOS 11.0 deployment target. Earlier checks also passed with OpenSSL 4.0.2 and Tongsuo 8.5.0 CLI loopback handshakes and SM3/SM4 vectors. These results do not establish GM TLS support or a working GM VPN data path on a real gateway device, or runtime compatibility with macOS 11. The full upstream cryptographic test suites were not run. See [VALIDATION.md](VALIDATION.md) for overall validation status.
 
 ## Optional static Tongsuo build
 

@@ -1,0 +1,20 @@
+{
+  "source": "assets/sslray.svg",
+  "source_sha256": "b4795739cd27371ff02a912d5675a91bf5b6e67891a287dfbbf033f55c6aaf38",
+  "renderer": "rsvg-convert version 2.63.0",
+  "sha256": {
+    "sslray-16.png": "c14850828dfeba5689477e70aaf5d012ea1f952484fa9d705bd17f55eeccfe35",
+    "sslray-20.png": "2fa96196a030dfee08d1fa04ffa04146947198e805c21e30b0dc021f4beaf285",
+    "sslray-24.png": "e907a695b95a00625fa6e29a3a391d1002065577098909e136ec3561eeaf7fc2",
+    "sslray-32.png": "11fff16b2353540a34a82e8e0dafa4c88770ac13fc6a9823ffd8c8b237c6dd3e",
+    "sslray-40.png": "5effc3d13e36ab151c5721aa3399cb4a2ab38177a3e2c8879ecb7e71ddd3bac1",
+    "sslray-48.png": "b89c3529900e6b9d45682fddac4569b584a565fc347905df09d8f1c97652346c",
+    "sslray-64.png": "7d2aebbb1e0d974caf6dc70b1a8c5ab0f352b07311d8ab1d31b5f4d4228224eb",
+    "sslray-128.png": "526ff92c48c94d43cb7d48bdd88a9625e069b745b7f3ec458664fb636970c7f8",
+    "sslray-256.png": "7b800b8ae86a53281417de2ecdb3a3e08ea0386afb7659affe646709202c3c52",
+    "sslray-512.png": "cd3662dd99b46d8652951c31d10846964a93d6ccc804f67622ec34a4ce7d38ac",
+    "sslray-1024.png": "345ad9a0860f497fd793517dd3d3cf03aa8ff9106ae28dab0f3ae54b02f49e04",
+    "SSLRay.ico": "98eb957df82249a7a9db1b19df596e0cd729306a4a571da4949fba07d5395eb1",
+    "SSLRay.icns": "4286c8fa7de9868df01a8e24a43726a09210bd0e3c8210ebbc2e1c37fe2281a6"
+  }
+}

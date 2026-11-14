@@ -1,5 +1,5 @@
-//! Read-only network interface inventory. Virtual-interface classification is a
-//! display hint based on interface names/types, not an authorization decision.
+//! Read-only metadata for one explicitly named session interface. Callers must
+//! obtain the name from the active SSLRay session, never a prefix/name guess.
 
 use anyhow::Result;
 use serde::Deserialize;
@@ -14,14 +14,18 @@ pub struct AdapterInfo {
     pub mtu: Option<u32>,
 }
 
-pub fn adapters() -> Result<Vec<AdapterInfo>> {
+pub fn adapter(name: &str) -> Result<Option<AdapterInfo>> {
+    anyhow::ensure!(
+        !name.is_empty() && name.len() <= 1024 && !name.contains('\0'),
+        "Invalid session interface name"
+    );
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
-        unix_adapters()
+        unix_adapter(name)
     }
     #[cfg(windows)]
     {
-        windows_adapters()
+        windows_adapter(name)
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     {
@@ -41,18 +45,15 @@ fn virtual_name(name: &str) -> bool {
         .any(|prefix| name.starts_with(prefix))
 }
 
-fn normalize(adapters: &mut [AdapterInfo]) {
-    adapters.sort_by(|left, right| left.name.cmp(&right.name));
-    for adapter in adapters {
-        adapter.addresses.sort();
-        adapter.addresses.dedup();
-        adapter.virtual_interface |= virtual_name(&adapter.name);
-    }
+fn normalize(adapter: &mut AdapterInfo) {
+    adapter.addresses.sort();
+    adapter.addresses.dedup();
+    adapter.virtual_interface |= virtual_name(&adapter.name);
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn unix_adapters() -> Result<Vec<AdapterInfo>> {
-    use std::{collections::BTreeMap, ffi::CStr, ptr};
+fn unix_adapter(target: &str) -> Result<Option<AdapterInfo>> {
+    use std::{ffi::CStr, ptr};
 
     struct Addresses(*mut libc::ifaddrs);
     impl Drop for Addresses {
@@ -69,7 +70,7 @@ fn unix_adapters() -> Result<Vec<AdapterInfo>> {
     }
     let list = Addresses(first);
     let mut current = list.0;
-    let mut found = BTreeMap::<String, AdapterInfo>::new();
+    let mut found = None::<AdapterInfo>;
     while !current.is_null() {
         // SAFETY: this entry and all its fields belong to the live getifaddrs list.
         let interface = unsafe { &*current };
@@ -81,7 +82,10 @@ fn unix_adapters() -> Result<Vec<AdapterInfo>> {
         let name = unsafe { CStr::from_ptr(interface.ifa_name) }
             .to_string_lossy()
             .into_owned();
-        let adapter = found.entry(name.clone()).or_insert_with(|| AdapterInfo {
+        if name != target {
+            continue;
+        }
+        let adapter = found.get_or_insert_with(|| AdapterInfo {
             virtual_interface: virtual_name(&name),
             name,
             addresses: Vec::new(),
@@ -98,12 +102,11 @@ fn unix_adapters() -> Result<Vec<AdapterInfo>> {
             adapter.addresses.push(address);
         }
     }
-    let mut adapters: Vec<_> = found.into_values().collect();
-    for adapter in &mut adapters {
+    if let Some(adapter) = &mut found {
         adapter.mtu = unix_mtu(&adapter.name);
+        normalize(adapter);
     }
-    normalize(&mut adapters);
-    Ok(adapters)
+    Ok(found)
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -283,7 +286,7 @@ fn unix_mtu(name: &str) -> Option<u32> {
 }
 
 #[cfg(windows)]
-fn windows_adapters() -> Result<Vec<AdapterInfo>> {
+fn windows_adapter(target: &str) -> Result<Option<AdapterInfo>> {
     use anyhow::{Context, bail, ensure};
     use std::{
         io::Read,
@@ -298,7 +301,9 @@ fn windows_adapters() -> Result<Vec<AdapterInfo>> {
     const SCRIPT: &str = r#"
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+$target = $env:SSLRAY_SESSION_INTERFACE
 $rows = @(foreach ($adapter in [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()) {
+    if ($adapter.Name -cne $target) { continue }
     $properties = $adapter.GetIPProperties()
     $mtu = $null
     try { $mtu = [uint32]$properties.GetIPv4Properties().Mtu } catch {
@@ -324,6 +329,9 @@ ConvertTo-Json -InputObject $rows -Compress -Depth 4
             "-Command",
             SCRIPT,
         ])
+        // The name is data, never interpolated into PowerShell source. Only
+        // matching interface names proceed to address/MTU collection above.
+        .env("SSLRAY_SESSION_INTERFACE", target)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -363,7 +371,7 @@ ConvertTo-Json -InputObject $rows -Compress -Depth 4
         data.len() <= LIMIT,
         "Network interface query output exceeds the limit"
     );
-    parse_windows(&data)
+    parse_windows(&data, target)
 }
 
 #[cfg(windows)]
@@ -387,23 +395,29 @@ fn windows_powershell() -> Result<std::path::PathBuf> {
 }
 
 #[cfg(any(windows, test))]
-fn parse_windows(data: &[u8]) -> Result<Vec<AdapterInfo>> {
+fn parse_windows(data: &[u8], target: &str) -> Result<Option<AdapterInfo>> {
     use anyhow::{Context, ensure};
     let data = data.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(data);
     let mut adapters: Vec<AdapterInfo> =
         serde_json::from_slice(data).context("Invalid Windows network interface inventory")?;
-    ensure!(adapters.len() <= 4096, "Too many network interfaces");
+    ensure!(
+        adapters.len() <= 1,
+        "Unexpected interfaces in session query"
+    );
     for adapter in &adapters {
         ensure!(
-            !adapter.name.is_empty()
+            adapter.name == target
                 && adapter.name.len() <= 1024
                 && adapter.addresses.len() <= 256
                 && adapter.addresses.iter().all(|address| address.len() <= 160),
             "Invalid network interface inventory entry"
         );
     }
-    normalize(&mut adapters);
-    Ok(adapters)
+    let mut adapter = adapters.pop();
+    if let Some(adapter) = &mut adapter {
+        normalize(adapter);
+    }
+    Ok(adapter)
 }
 
 #[cfg(test)]
@@ -419,34 +433,44 @@ mod tests {
     }
 
     #[test]
-    fn windows_inventory_keeps_inactive_interfaces_and_deduplicates_addresses() {
+    fn windows_query_accepts_only_the_exact_session_interface() {
         let rows = br#"[
-            {"name":"wintun-test","addresses":["192.0.2.2/32","192.0.2.2/32"],"is_up":false,"virtual_interface":false,"mtu":1400},
-            {"name":"Ethernet","addresses":["2001:db8::1/64","192.0.2.1/24"],"is_up":true,"virtual_interface":false,"mtu":1500}
+            {"name":"wintun-test","addresses":["192.0.2.2/32","192.0.2.2/32"],"is_up":false,"virtual_interface":false,"mtu":1400}
         ]"#;
-        let adapters = parse_windows(rows).unwrap();
-        assert_eq!(adapters[0].name, "Ethernet");
-        assert_eq!(adapters[0].addresses.len(), 2);
-        assert_eq!(adapters[1].addresses.len(), 1);
-        assert!(!adapters[1].is_up && adapters[1].virtual_interface);
-        assert_eq!(adapters[1].mtu, Some(1400));
-        assert!(parse_windows(br#"{"name":"not-an-array"}"#).is_err());
+        let adapter = parse_windows(rows, "wintun-test").unwrap().unwrap();
+        assert_eq!(adapter.name, "wintun-test");
+        assert_eq!(adapter.addresses.len(), 1);
+        assert!(!adapter.is_up && adapter.virtual_interface);
+        assert_eq!(adapter.mtu, Some(1400));
+        assert!(parse_windows(rows, "wintun-other").is_err());
+        assert!(parse_windows(rows, "WINTUN-TEST").is_err());
+        assert!(parse_windows(b"[]", "wintun-test").unwrap().is_none());
+        assert!(parse_windows(br#"[{"name":"Ethernet","addresses":[],"is_up":true,"virtual_interface":false,"mtu":1500},{"name":"wintun-test","addresses":[],"is_up":true,"virtual_interface":true,"mtu":1400}]"#, "wintun-test").is_err());
+        assert!(parse_windows(br#"{"name":"not-an-array"}"#, "wintun-test").is_err());
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
-    fn native_inventory_contains_loopback_and_addresses() {
-        let adapters = adapters().unwrap();
-        assert!(!adapters.is_empty());
-        assert!(adapters.iter().any(|adapter| {
-            adapter.is_up
-                && adapter.virtual_interface
-                && adapter
-                    .addresses
-                    .iter()
-                    .any(|address| address.starts_with("127.0.0.1"))
-        }));
-        assert!(adapters.iter().any(|adapter| adapter.mtu.is_some()));
+    fn native_query_reads_only_the_requested_name() {
+        let name = if cfg!(target_os = "macos") {
+            "lo0"
+        } else {
+            "lo"
+        };
+        let interface = adapter(name).unwrap().unwrap();
+        assert_eq!(interface.name, name);
+        assert!(interface.is_up && interface.virtual_interface);
+        assert!(
+            interface
+                .addresses
+                .iter()
+                .any(|address| address.starts_with("127.0.0.1"))
+        );
+        assert!(interface.mtu.is_some());
+        assert!(adapter(&format!("{name}*")).unwrap().is_none());
+        assert!(adapter("sslray-no-such-interface").unwrap().is_none());
+        assert!(adapter("").is_err());
+        assert!(adapter("bad\0name").is_err());
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]

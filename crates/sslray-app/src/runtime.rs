@@ -145,6 +145,7 @@ pub enum ConnectionState {
 }
 #[derive(Clone, Debug)]
 pub struct Snapshot {
+    pub session_generation: u64,
     pub state: ConnectionState,
     pub message: String,
     pub credentials_rejected: bool,
@@ -164,6 +165,7 @@ pub struct Snapshot {
 impl Default for Snapshot {
     fn default() -> Self {
         Self {
+            session_generation: 0,
             state: ConnectionState::Disconnected,
             credentials_rejected: false,
             authorization_failed: false,
@@ -200,6 +202,7 @@ impl Drop for Request {
 }
 
 pub struct Controller {
+    session_generation: u64,
     snapshot: Snapshot,
     events: Option<Receiver<Event>>,
     cancel: Arc<AtomicBool>,
@@ -209,6 +212,7 @@ pub struct Controller {
 impl Controller {
     pub fn new() -> Self {
         Self {
+            session_generation: 0,
             snapshot: Snapshot::default(),
             events: None,
             cancel: Arc::new(AtomicBool::new(false)),
@@ -232,7 +236,10 @@ impl Controller {
         if self.events.is_some() {
             return false;
         }
-        self.snapshot = Snapshot::default();
+        self.snapshot = Snapshot {
+            session_generation: self.session_generation,
+            ..Snapshot::default()
+        };
         true
     }
     pub fn connect(
@@ -266,6 +273,7 @@ impl Controller {
         self.cancel = Arc::new(AtomicBool::new(false));
         let cancel = self.cancel.clone();
         self.snapshot = Snapshot {
+            session_generation: self.session_generation,
             state: ConnectionState::Connecting,
             message: "Waiting for administrator authorization".into(),
             ..Snapshot::default()
@@ -331,6 +339,8 @@ impl Controller {
                     cipher,
                     transport,
                 } => {
+                    self.session_generation = self.session_generation.saturating_add(1);
+                    self.snapshot.session_generation = self.session_generation;
                     self.snapshot.state = ConnectionState::Connected;
                     self.snapshot.interface = Some(interface);
                     self.snapshot.address = Some(address);
@@ -370,6 +380,11 @@ impl Controller {
                     self.events = None;
                     self.otp_sender = None;
                     self.snapshot.challenge = None;
+                    // The helper acknowledges completion only after the session
+                    // returned and the tunnel handle was dropped. Keep route
+                    // cleanup diagnostics, but never present its old interface.
+                    self.snapshot.interface = None;
+                    self.snapshot.address = None;
                     if self.snapshot.state != ConnectionState::Failed {
                         self.snapshot.state = ConnectionState::Disconnected;
                         self.snapshot.message = "Disconnected; split routes removed".into();
@@ -1104,6 +1119,65 @@ mod tests {
         assert!(controller.reset_snapshot());
         assert_eq!(controller.snapshot.tx_bytes, 0);
         assert!(!controller.authority.closed.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn completed_sessions_clear_adapter_identity_without_losing_cleanup_errors() {
+        let mut controller = Controller::new();
+        for cleanup_failed in [false, true] {
+            let (tx, rx) = mpsc::channel();
+            controller.events = Some(rx);
+            tx.send(Event::Connected {
+                interface: "utun40".into(),
+                address: "192.0.2.2".into(),
+                cipher: "test".into(),
+                transport: "TLS".into(),
+            })
+            .unwrap();
+            tx.send(Event::Routes {
+                advertised_routes: vec![],
+                applied_routes: vec!["192.0.2.0/24".into()],
+            })
+            .unwrap();
+            controller.poll();
+            let generation = controller.snapshot.session_generation;
+            assert!(generation > 0);
+            assert_eq!(controller.snapshot.interface.as_deref(), Some("utun40"));
+            if cleanup_failed {
+                tx.send(Event::Error {
+                    message: "Route cleanup failed".into(),
+                })
+                .unwrap();
+            } else {
+                tx.send(Event::Routes {
+                    advertised_routes: vec![],
+                    applied_routes: vec![],
+                })
+                .unwrap();
+            }
+            controller.poll();
+            assert!(controller.is_busy());
+            assert!(controller.snapshot.interface.is_some());
+            tx.send(Event::Disconnected).unwrap();
+            controller.poll();
+            assert!(!controller.is_busy());
+            assert!(
+                controller.snapshot.interface.is_none() && controller.snapshot.address.is_none()
+            );
+            assert_eq!(
+                !controller.snapshot.applied_routes.is_empty(),
+                cleanup_failed
+            );
+            assert!(controller.reset_snapshot());
+            assert_eq!(controller.snapshot.session_generation, generation);
+            let invalid = Profile {
+                host: String::new(),
+                ..Profile::default()
+            };
+            assert!(controller.connect(invalid, String::new(), None).is_err());
+            assert_eq!(controller.snapshot.session_generation, generation);
+        }
+        assert_eq!(controller.snapshot.session_generation, 2);
     }
 
     #[test]

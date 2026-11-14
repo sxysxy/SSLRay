@@ -14,20 +14,23 @@ Only IPv4 traffic is carried. System DNS changes, a kill switch, and automatic r
 
 ## Build and run
 
-Requires Rust 1.95+, compatible OpenSSL development libraries, and the [platform dependencies](docs/PLATFORMS.md).
+Requires Rust 1.95+ and the [platform dependencies](docs/PLATFORMS.md). macOS builds compile the pinned official OpenSSL submodule and link it statically, without Homebrew OpenSSL. Xcode command-line tools, Perl, make, and Python 3.11+ are required.
 
 ```sh
-cargo run -p sslray
+git submodule update --init third_party/openssl
+./scripts/cargo-macos.sh run -p sslray --locked
 ```
 
-The macOS development bundle also requires Python 3.11+:
+The complete source ZIP already contains OpenSSL; its Git initialization step can be skipped.
+
+Build a macOS development bundle with the same backend:
 
 ```sh
 ./scripts/bundle-macos.sh
 open dist/SSLRay.app
 ```
 
-The script bundles TLS dynamic libraries, collects licenses, and applies an ad-hoc signature. The current Apple Silicon bundle requires macOS 26.0+; the actual minimum is derived from the executable and bundled libraries.
+The script collects licenses, includes the shared application icon, and applies an ad-hoc signature. The default Apple Silicon deployment target is macOS 11.0; the executable and static TLS libraries are checked against it. Older macOS versions still require runtime validation. Linux/Windows use their native toolchains and OpenSSL development libraries.
 
 ## Connect
 
@@ -37,13 +40,15 @@ The script bundles TLS dynamic libraries, collects licenses, and applies an ad-h
 4. Save the profile, select it by name in **Overview**, and connect. A missing main password is requested for that connection. OTPs may be entered in advance or when the gateway sends a challenge.
 5. The first connection requests administrator authorization. The helper can be reused within the same app process. New connections require authorization again after 10 minutes idle or a one-hour authorization lifetime; an active tunnel is not interrupted. Failed authorization can be retried manually.
 
-Profiles can be duplicated, renamed, or deleted; switching prompts you to handle unsaved changes. **Application settings** contains appearance, language, adapter information, and the software version. When the tray is available, closing the window hides it; quitting the app ends the session.
+Profiles can be duplicated, renamed, or deleted; switching prompts you to handle unsaved changes. **Application settings** contains appearance, language, the active SSLRay adapter, and the software version. When the tray is available, closing the window hides it; quitting the app ends the session.
 
 Main passwords are not saved by default. Enabling **Save main password locally** stores **Base64** in local `profiles.json`; the confirmation shows its full path. Base64 is reversible, not encryption, and the stored configuration is not uploaded to the cloud. **OTPs are never saved.** See [system and configuration details](docs/PLATFORMS.md) for migration, permissions, and routing policies.
 
 Legacy Huawei CHIV3 UDP is opt-in and uses AES-128-CBC without a per-packet MAC. Auto keeps TLS for these gateways. GM TLS mode never falls back to standard algorithms or uses an AES UDP data channel.
 
 ## Command line
+
+On macOS, replace `cargo` below with `./scripts/cargo-macos.sh` to use the project backend.
 
 ```sh
 cargo run -p sslray -- capabilities
@@ -56,6 +61,8 @@ cargo run -p sslray -- connect --profile profile.json
 `auth-test` does not modify host interfaces or routes. `connect` runs in the foreground; Ctrl-C disconnects and cleans up. The CLI uses a single-profile JSON file and a hidden password prompt; automation can use `--password-stdin`, and `--otp` requests a second password. Do not put credentials in command arguments, environment variables, or version control.
 
 ## Development and documentation
+
+The macOS Cargo wrapper also accepts `test`, `clippy`, and other Cargo commands.
 
 `sslray-core` is the protocol, cryptography, interface, and routing library. `sslray-app` provides the GUI/CLI and manages a privileged helper subprocess of the same executable over authenticated local IPC. The helper calls core to run the tunnel; the UI remains unprivileged.
 

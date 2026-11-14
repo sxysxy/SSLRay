@@ -1,6 +1,6 @@
 use crate::i18n::{self, Language, Text as T, text};
 use crate::profiles::ProfileLibrary;
-use crate::runtime::{ConnectionState, Controller};
+use crate::runtime::{ConnectionState, Controller, Snapshot};
 use crate::system_info::{self, AdapterInfo};
 use crate::tray;
 use anyhow::{Context, Result};
@@ -128,6 +128,104 @@ impl Notice {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AdapterTarget {
+    session_generation: u64,
+    name: String,
+    address: Option<String>,
+    configured_mtu: u16,
+}
+
+impl AdapterTarget {
+    fn from_snapshot(snapshot: &Snapshot, busy: bool, configured_mtu: u16) -> Option<Self> {
+        // Failed sessions can still be cleaning up. The worker's final
+        // Disconnected acknowledgment, rather than the headline state alone,
+        // ends ownership of the interface for display purposes.
+        if !busy
+            || !matches!(
+                snapshot.state,
+                ConnectionState::Connected
+                    | ConnectionState::Disconnecting
+                    | ConnectionState::Failed
+            )
+        {
+            return None;
+        }
+        let name = snapshot
+            .interface
+            .as_ref()
+            .filter(|name| !name.is_empty())?;
+        Some(Self {
+            session_generation: snapshot.session_generation,
+            name: name.clone(),
+            address: snapshot.address.clone(),
+            configured_mtu,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AdapterRequest {
+    generation: u64,
+    target: AdapterTarget,
+}
+
+struct AdapterResponse {
+    request: AdapterRequest,
+    result: std::result::Result<Option<AdapterInfo>, String>,
+}
+
+#[derive(Default)]
+struct AdapterDisplay {
+    target: Option<AdapterTarget>,
+    generation: u64,
+    metadata: Option<AdapterInfo>,
+    error: Option<String>,
+}
+
+impl AdapterDisplay {
+    fn select(&mut self, target: Option<AdapterTarget>) -> bool {
+        if self.target == target {
+            return false;
+        }
+        self.target = target;
+        self.generation = self.generation.saturating_add(1);
+        self.metadata = None;
+        self.error = None;
+        true
+    }
+
+    fn refresh(&mut self) -> Option<AdapterRequest> {
+        let target = self.target.clone()?;
+        self.generation = self.generation.saturating_add(1);
+        self.metadata = None;
+        self.error = None;
+        Some(AdapterRequest {
+            generation: self.generation,
+            target,
+        })
+    }
+
+    fn accept(&mut self, response: AdapterResponse) -> bool {
+        if response.request.generation != self.generation
+            || self.target.as_ref() != Some(&response.request.target)
+        {
+            return false;
+        }
+        self.metadata = None;
+        self.error = None;
+        match response.result {
+            Ok(Some(adapter)) if adapter.name == response.request.target.name => {
+                self.metadata = Some(adapter);
+            }
+            Ok(Some(_)) => self.error = Some("Unexpected interface in session query".into()),
+            Ok(None) => {}
+            Err(error) => self.error = Some(error),
+        }
+        true
+    }
+}
+
 struct App {
     controller: Controller,
     profile: Profile,
@@ -156,11 +254,9 @@ struct App {
     challenge_focus: bool,
     crypto_backend: String,
     gm_available: bool,
-    adapters: Vec<AdapterInfo>,
-    adapter_query: Option<std::sync::mpsc::Receiver<std::result::Result<Vec<AdapterInfo>, String>>>,
-    adapter_error: Option<String>,
+    adapter_display: AdapterDisplay,
+    adapter_query: Option<std::sync::mpsc::Receiver<AdapterResponse>>,
     authorization_retry: bool,
-    adapter_loaded: bool,
     pending_password: Option<Zeroizing<String>>,
     pending_otp: Option<Zeroizing<String>>,
 }
@@ -262,11 +358,9 @@ impl App {
             theme,
             challenge_prompted: false,
             challenge_focus: false,
-            adapters: vec![],
+            adapter_display: AdapterDisplay::default(),
             adapter_query: None,
-            adapter_error: None,
             authorization_retry: false,
-            adapter_loaded: false,
             pending_password: None,
             pending_otp: None,
         }
@@ -1782,19 +1876,48 @@ impl App {
         });
     }
 
-    fn refresh_adapters(&mut self, ctx: &egui::Context) {
+    fn refresh_adapter(&mut self, ctx: &egui::Context) {
         if self.adapter_query.is_some() {
             return;
         }
+        let Some(request) = self.adapter_display.refresh() else {
+            return;
+        };
         let (sender, receiver) = std::sync::mpsc::channel();
         self.adapter_query = Some(receiver);
-        self.adapter_loaded = true;
-        self.adapter_error = None;
         let context = ctx.clone();
         std::thread::spawn(move || {
-            let _ = sender.send(system_info::adapters().map_err(|error| error.to_string()));
+            let result =
+                system_info::adapter(&request.target.name).map_err(|error| error.to_string());
+            let _ = sender.send(AdapterResponse { request, result });
             context.request_repaint();
         });
+    }
+
+    fn sync_adapter(&mut self, ctx: &egui::Context) {
+        let target =
+            AdapterTarget::from_snapshot(self.controller.snapshot(), self.busy(), self.profile.mtu);
+        if self.adapter_display.select(target) {
+            // Dropping the old receiver prevents results from a disconnected
+            // session from being routed into a new query, even with the same name.
+            self.adapter_query = None;
+            self.refresh_adapter(ctx);
+        }
+        let result = self
+            .adapter_query
+            .as_ref()
+            .map(|receiver| receiver.try_recv());
+        match result {
+            Some(Ok(response)) => {
+                self.adapter_query = None;
+                self.adapter_display.accept(response);
+            }
+            Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                self.adapter_query = None;
+                self.adapter_display.error = Some(text(self.language, T::AdapterReadFailed).into());
+            }
+            _ => {}
+        }
     }
 
     fn authorization_help(&self) -> T {
@@ -1810,9 +1933,7 @@ impl App {
     fn application_settings(&mut self, ui: &mut egui::Ui) {
         let lang = self.language;
         let colors = palette(ui);
-        if !self.adapter_loaded {
-            self.refresh_adapters(ui.ctx());
-        }
+        self.sync_adapter(ui.ctx());
         card(ui).show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             ui.label(RichText::new(text(lang, T::Appearance)).size(16.0).strong());
@@ -1833,76 +1954,95 @@ impl App {
                 );
                 if ui
                     .add_enabled(
-                        self.adapter_query.is_none(),
+                        self.adapter_display.target.is_some() && self.adapter_query.is_none(),
                         egui::Button::new(text(lang, T::Refresh)),
                     )
                     .clicked()
                 {
-                    self.refresh_adapters(ui.ctx());
+                    self.refresh_adapter(ui.ctx());
                 }
             });
             ui.add_space(10.0);
             if self.adapter_query.is_some() {
                 ui.label(text(lang, T::Loading));
             }
-            if let Some(error) = &self.adapter_error {
+            if let Some(error) = &self.adapter_display.error {
                 ui.label(
                     RichText::new(format!("{}: {error}", text(lang, T::AdapterReadFailed)))
-                        .color(colors.danger),
+                        .color(colors.warning),
                 );
-            } else if self.adapters.is_empty() && self.adapter_query.is_none() {
-                ui.label(text(lang, T::NoAdapters));
             }
-            egui::ScrollArea::vertical()
-                .id_salt("adapter-list")
-                .max_height(240.0)
-                .show(ui, |ui| {
-                    for adapter in &self.adapters {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(
-                                RichText::new(format!(
-                                    "{}: {}",
-                                    text(lang, T::AdapterName),
-                                    adapter.name
-                                ))
-                                .strong(),
-                            );
-                            badge(
-                                ui,
-                                text(
-                                    lang,
-                                    if adapter.is_up {
-                                        T::AdapterUp
-                                    } else {
-                                        T::AdapterDown
-                                    },
-                                ),
-                            );
-                            if adapter.virtual_interface {
-                                badge(ui, text(lang, T::TunnelAdapter));
-                            }
-                            if let Some(mtu) = adapter.mtu {
-                                ui.label(format!("MTU {mtu}"));
-                            }
-                        });
-                        ui.label(
-                            RichText::new(format!(
-                                "{}: {}",
-                                text(lang, T::AdapterAddresses),
-                                if adapter.addresses.is_empty() {
-                                    "—".into()
+            if let Some(target) = &self.adapter_display.target {
+                let metadata = self.adapter_display.metadata.as_ref();
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new(format!("{}: {}", text(lang, T::AdapterName), target.name))
+                            .strong(),
+                    );
+                    if let Some(adapter) = metadata {
+                        badge(
+                            ui,
+                            text(
+                                lang,
+                                if adapter.is_up {
+                                    T::AdapterUp
                                 } else {
-                                    adapter.addresses.join("  ·  ")
-                                }
-                            ))
-                            .monospace()
-                            .size(12.0)
-                            .color(colors.muted),
+                                    T::AdapterDown
+                                },
+                            ),
                         );
-                        ui.add_space(7.0);
-                        ui.separator();
+                        if adapter.virtual_interface {
+                            badge(ui, text(lang, T::TunnelAdapter));
+                        }
+                        if let Some(mtu) = adapter.mtu {
+                            ui.label(format!("MTU {mtu}"));
+                        }
                     }
                 });
+                if let Some(adapter) = metadata {
+                    ui.label(
+                        RichText::new(format!(
+                            "{}: {}",
+                            text(lang, T::AdapterAddresses),
+                            if adapter.addresses.is_empty() {
+                                "—".into()
+                            } else {
+                                adapter.addresses.join("  ·  ")
+                            }
+                        ))
+                        .monospace()
+                        .size(12.0)
+                        .color(colors.muted),
+                    );
+                } else {
+                    // Only known values from this session are shown on lookup
+                    // failure; never replace them with another local interface.
+                    ui.label(
+                        RichText::new(text(lang, T::AdapterSnapshotOnly))
+                            .size(12.0)
+                            .color(colors.muted),
+                    );
+                    ui.label(format!(
+                        "{}: {}",
+                        text(lang, T::AdapterAddresses),
+                        target.address.as_deref().unwrap_or("—")
+                    ));
+                    ui.label(format!(
+                        "{}: {}",
+                        text(lang, T::ConfiguredMtu),
+                        target.configured_mtu
+                    ));
+                }
+            } else {
+                ui.label(text(lang, T::NoAdapters));
+                if !self.controller.snapshot().applied_routes.is_empty() {
+                    ui.label(
+                        RichText::new(text(lang, T::AdapterCleanupUnconfirmed))
+                            .size(12.0)
+                            .color(colors.warning),
+                    );
+                }
+            }
         });
         ui.add_space(16.0);
         card(ui).show(ui, |ui| {
@@ -1961,23 +2101,7 @@ impl eframe::App for App {
                 self.pending_otp = None;
             }
         }
-        if let Some(receiver) = &self.adapter_query {
-            match receiver.try_recv() {
-                Ok(Ok(adapters)) => {
-                    self.adapters = adapters;
-                    self.adapter_query = None;
-                }
-                Ok(Err(error)) => {
-                    self.adapter_error = Some(error);
-                    self.adapter_query = None;
-                }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.adapter_error = Some(text(self.language, T::AdapterReadFailed).into());
-                    self.adapter_query = None;
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
-            }
-        }
+        self.sync_adapter(ctx);
         if self.controller.snapshot().credentials_rejected
             && !self.rejection_handled
             && !self.busy()
@@ -2462,11 +2586,9 @@ mod tests {
                 challenge_focus: false,
                 crypto_backend: String::new(),
                 gm_available: false,
-                adapters: vec![],
+                adapter_display: AdapterDisplay::default(),
                 adapter_query: None,
-                adapter_error: None,
                 authorization_retry: false,
-                adapter_loaded: false,
                 pending_password: None,
                 pending_otp: None,
             })
@@ -2549,5 +2671,124 @@ mod tests {
         assert_eq!(preferences.language, Language::En);
         let legacy: UiPreferences = serde_json::from_str(r#"{"language":"en"}"#).unwrap();
         assert_eq!(legacy.theme, Theme::Light);
+    }
+
+    fn adapter_snapshot(state: ConnectionState, session_generation: u64) -> Snapshot {
+        Snapshot {
+            session_generation,
+            state,
+            interface: Some("utun40".into()),
+            address: Some("192.0.2.2".into()),
+            ..Snapshot::default()
+        }
+    }
+
+    #[test]
+    fn adapter_selection_follows_session_ownership_through_cleanup() {
+        for state in [
+            ConnectionState::Disconnected,
+            ConnectionState::Connecting,
+            ConnectionState::AwaitingOtp,
+        ] {
+            let snapshot = adapter_snapshot(state, 1);
+            assert!(AdapterTarget::from_snapshot(&snapshot, true, 1400).is_none());
+        }
+        for state in [
+            ConnectionState::Connected,
+            ConnectionState::Disconnecting,
+            ConnectionState::Failed,
+        ] {
+            let snapshot = adapter_snapshot(state, 1);
+            let target = AdapterTarget::from_snapshot(&snapshot, true, 1400).unwrap();
+            assert_eq!(target.name, "utun40");
+            assert_eq!(target.address.as_deref(), Some("192.0.2.2"));
+            assert!(AdapterTarget::from_snapshot(&snapshot, false, 1400).is_none());
+        }
+        let snapshot = Snapshot {
+            state: ConnectionState::Failed,
+            applied_routes: vec!["192.0.2.0/24".into()],
+            ..Snapshot::default()
+        };
+        assert!(AdapterTarget::from_snapshot(&snapshot, false, 1400).is_none());
+    }
+
+    #[test]
+    fn adapter_results_from_previous_same_name_sessions_or_refreshes_are_ignored() {
+        let target = AdapterTarget::from_snapshot(
+            &adapter_snapshot(ConnectionState::Connected, 1),
+            true,
+            1400,
+        )
+        .unwrap();
+        let mut display = AdapterDisplay::default();
+        display.select(Some(target.clone()));
+        let old = display.refresh().unwrap();
+        display.select(None);
+        assert!(!display.accept(AdapterResponse {
+            request: old.clone(),
+            result: Ok(None)
+        }));
+        let next = AdapterTarget {
+            session_generation: 2,
+            ..target
+        };
+        display.select(Some(next.clone()));
+        let current = display.refresh().unwrap();
+        assert!(!display.accept(AdapterResponse {
+            request: old,
+            result: Err("old session failure".into())
+        }));
+        assert!(display.error.is_none() && display.metadata.is_none());
+        let metadata = AdapterInfo {
+            name: "utun40".into(),
+            addresses: vec!["192.0.2.2/32".into()],
+            is_up: true,
+            virtual_interface: true,
+            mtu: Some(1380),
+        };
+        assert!(display.accept(AdapterResponse {
+            request: current.clone(),
+            result: Ok(Some(metadata.clone()))
+        }));
+        assert_eq!(display.metadata, Some(metadata.clone()));
+        let refreshed = display.refresh().unwrap();
+        assert!(!display.accept(AdapterResponse {
+            request: current,
+            result: Ok(Some(metadata))
+        }));
+        assert!(display.accept(AdapterResponse {
+            request: refreshed,
+            result: Err("query failed".into())
+        }));
+        assert!(display.metadata.is_none());
+        assert_eq!(display.target, Some(next));
+        assert_eq!(display.error.as_deref(), Some("query failed"));
+    }
+
+    #[test]
+    fn adapter_query_never_replaces_session_with_another_local_interface() {
+        let mut display = AdapterDisplay::default();
+        display.select(AdapterTarget::from_snapshot(
+            &adapter_snapshot(ConnectionState::Connected, 1),
+            true,
+            1400,
+        ));
+        let request = display.refresh().unwrap();
+        let other = AdapterInfo {
+            name: "utun41".into(),
+            addresses: vec![],
+            is_up: true,
+            virtual_interface: true,
+            mtu: Some(1500),
+        };
+        assert!(display.accept(AdapterResponse {
+            request,
+            result: Ok(Some(other))
+        }));
+        assert!(display.metadata.is_none() && display.error.is_some());
+        assert_eq!(display.target.as_ref().unwrap().name, "utun40");
+        display.select(None);
+        assert!(display.target.is_none() && display.error.is_none() && display.metadata.is_none());
+        assert!(display.refresh().is_none());
     }
 }
