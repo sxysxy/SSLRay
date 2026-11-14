@@ -209,7 +209,7 @@ catalog! {
     CertificateCancel => ("取消连接", "Cancel connection"),
     CertificateContinue => ("信任并继续", "Trust and continue"),
     CertificateRememberContinue => ("记住并继续", "Remember and continue"),
-    CertificateHelp => ("默认验证系统 CA 与主机名。私有 CA 网关可使用经过管理员核实的 SHA-256 证书指纹。", "System CAs and the hostname are verified by default. For a private CA gateway, use a SHA-256 certificate fingerprint verified with your administrator."),
+    CertificateHelp => ("默认验证系统 CA 与主机名。异常证书可在连接弹窗中确认信任，也可在这里预先填写核实的 SHA-256 指纹。", "System CAs and the hostname are verified by default. Review certificate warnings when connecting, or enter a verified SHA-256 fingerprint here."),
     OvpnCertificateHelp => ("默认使用 .ovpn 配置中的 CA 与服务器身份策略；可额外固定服务器 SHA-256 指纹，切换服务器时请确认该值。", "Uses the CA and server identity policy in .ovpn by default. You may additionally pin the server SHA-256 fingerprint; confirm this value when switching servers."),
     FingerprintHint => ("SHA-256 证书指纹（可选）", "SHA-256 certificate fingerprint (optional)"),
     Routing => ("路由配置", "Routing"),

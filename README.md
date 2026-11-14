@@ -35,7 +35,7 @@ The script collects licenses, includes the shared application icon, and applies 
 ## Connect
 
 1. Create a uniquely named profile in **Settings**. Enter the gateway and account for Huawei/Cisco, or use **Browse…** to select an OpenVPN `.ovpn` file.
-2. Certificate verification is enabled by default. For private-CA gateways, use a SHA-256 fingerprint verified with your administrator. OpenVPN follows the CA/server identity policy in its configuration.
+2. Huawei/Cisco verify certificates by default. For self-signed, expired, or name-mismatched certificates, review the warning and fingerprint before continuing. **Remember this certificate** saves its fingerprint to the selected profile; changed certificates are rejected. OpenVPN follows its `.ovpn` CA/server identity policy.
 3. By default, only valid gateway-advertised split routes are used; the manual list is empty. Full tunnel requires explicit selection. Advertised and applied routes are shown separately as read-only lists.
 4. Save the profile, select it by name in **Overview**, and connect. A missing main password is requested for that connection. OTPs may be entered in advance or when the gateway sends a challenge.
 5. The first connection requests administrator authorization. The helper can be reused within the same app process. New connections require authorization again after 10 minutes idle or a one-hour authorization lifetime; an active tunnel is not interrupted. Failed authorization can be retried manually.

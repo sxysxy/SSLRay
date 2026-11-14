@@ -3086,14 +3086,26 @@ mod tests {
         };
         app.approve_certificate(&review).unwrap();
         assert_eq!(serde_json::to_value(&app.profile).unwrap(), before);
-        assert!(app.profiles.selected().profile.certificate_sha256.is_empty());
-        let connection = app.certificate_approval.as_ref().unwrap()
-            .connection_profile(app.profiles.selected_id, &app.profile).unwrap();
-        assert_eq!(connection.certificate_sha256, review.report.certificate_sha256);
-        let mut expected = before;
-        expected["certificate_sha256"] = serde_json::Value::String(
-            review.report.certificate_sha256.clone()
+        assert!(
+            app.profiles
+                .selected()
+                .profile
+                .certificate_sha256
+                .is_empty()
         );
+        let connection = app
+            .certificate_approval
+            .as_ref()
+            .unwrap()
+            .connection_profile(app.profiles.selected_id, &app.profile)
+            .unwrap();
+        assert_eq!(
+            connection.certificate_sha256,
+            review.report.certificate_sha256
+        );
+        let mut expected = before;
+        expected["certificate_sha256"] =
+            serde_json::Value::String(review.report.certificate_sha256.clone());
         assert_eq!(serde_json::to_value(&connection).unwrap(), expected);
         assert!(!app.config_dir.as_ref().unwrap().exists());
         assert!(!app.controller.is_busy());
@@ -3117,12 +3129,18 @@ mod tests {
         app.approve_certificate(&review).unwrap();
         let loaded = ProfileLibrary::load(app.config_dir.as_ref().unwrap()).unwrap();
         assert_eq!(loaded.selected_id, app.profiles.selected_id);
-        assert_eq!(loaded.selected().profile.certificate_sha256, review.report.certificate_sha256);
-        assert_eq!(app.profile.certificate_sha256, review.report.certificate_sha256);
+        assert_eq!(
+            loaded.selected().profile.certificate_sha256,
+            review.report.certificate_sha256
+        );
+        assert_eq!(
+            app.profile.certificate_sha256,
+            review.report.certificate_sha256
+        );
         assert!(loaded.selected().saved_password.is_none());
-        let stored = std::fs::read_to_string(
-            app.config_dir.as_ref().unwrap().join("profiles.json")
-        ).unwrap();
+        let stored =
+            std::fs::read_to_string(app.config_dir.as_ref().unwrap().join("profiles.json"))
+                .unwrap();
         assert!(!stored.contains("synthetic-main-password-not-saved"));
         assert!(!stored.contains("123456"));
         assert!(!stored.contains("\"saved_password\""));
@@ -3148,7 +3166,13 @@ mod tests {
         };
         assert!(app.approve_certificate(&review).is_err());
         assert_eq!(serde_json::to_value(&app.profile).unwrap(), before);
-        assert!(app.profiles.selected().profile.certificate_sha256.is_empty());
+        assert!(
+            app.profiles
+                .selected()
+                .profile
+                .certificate_sha256
+                .is_empty()
+        );
         assert!(app.certificate_approval.is_none());
         assert!(!app.config_dir.as_ref().unwrap().exists());
         assert!(!app.controller.is_busy());
