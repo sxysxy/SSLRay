@@ -4,12 +4,26 @@ use anyhow::{Context, Result, bail, ensure};
 use openssl::{
     hash::MessageDigest,
     ssl::{SslConnector, SslMethod, SslStream, SslVerifyMode, SslVersion},
+    x509::verify::X509VerifyFlags,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     net::{TcpStream, ToSocketAddrs},
+    sync::{Arc, Mutex},
     time::Duration,
 };
+
+/// Public certificate metadata, not permission to send credentials. Nonempty
+/// verification_errors require an explicit user decision before connecting.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CertificateReport {
+    pub certificate_sha256: String,
+    pub subject: String,
+    pub issuer: String,
+    pub not_before: String,
+    pub not_after: String,
+    pub verification_errors: Vec<String>,
+}
 
 #[derive(Debug, Serialize)]
 pub struct Capabilities {
@@ -66,6 +80,10 @@ pub fn connect(profile: &Profile) -> Result<SslStream<TcpStream>> {
         .connect(&profile.host, socket)
         .map_err(|e| anyhow::anyhow!("TLS handshake failed: {e}"))?;
     verify_pin(&stream, &profile.certificate_sha256)?;
+    verify_negotiated_crypto(&stream, profile)?;
+    Ok(stream)
+}
+fn verify_negotiated_crypto(stream: &SslStream<TcpStream>, profile: &Profile) -> Result<()> {
     if profile.crypto == CryptoMode::GmTls13 {
         let cipher = stream
             .ssl()
@@ -76,7 +94,7 @@ pub fn connect(profile: &Profile) -> Result<SslStream<TcpStream>> {
             "Gateway did not negotiate a GM cipher"
         );
     }
-    Ok(stream)
+    Ok(())
 }
 fn tcp_connect(profile: &Profile) -> Result<TcpStream> {
     let addresses: Vec<_> = (profile.host.as_str(), profile.port)
@@ -116,26 +134,111 @@ fn verify_pin(stream: &SslStream<TcpStream>, expected: &str) -> Result<()> {
     );
     Ok(())
 }
-/// Certificate discovery sends no application data or credentials. This is not trust approval.
-pub fn inspect(profile: &Profile) -> Result<serde_json::Value> {
+// Stable OpenSSL X509_V_ERR values. Only missing trust, certificate validity
+// dates, and endpoint-name mismatches are eligible for explicit user approval.
+// Invalid signatures, revocation, invalid CA constraints/purpose, weak keys,
+// malformed dates, and unknown future errors remain fatal.
+fn approvable_verification_error(code: i32) -> bool {
+    matches!(code, 2 | 9 | 10 | 18 | 19 | 20 | 21 | 27 | 62 | 64)
+}
+
+fn certificate_stream(profile: &Profile) -> Result<(SslStream<TcpStream>, Vec<String>)> {
     profile.validate()?;
-    let mut builder = SslConnector::builder(SslMethod::tls_client())?;
-    builder.set_min_proto_version(Some(SslVersion::TLS1_2))?;
-    builder.set_verify(SslVerifyMode::NONE);
-    let mut config = builder.build().configure()?;
-    config.set_verify_hostname(false);
+    certificate_stream_with_connector(profile, connector(profile)?)
+}
+
+fn certificate_stream_with_connector(
+    profile: &Profile,
+    connector: SslConnector,
+) -> Result<(SslStream<TcpStream>, Vec<String>)> {
+    let mut config = connector.configure()?;
+    let errors = Arc::new(Mutex::new(Vec::<String>::new()));
+    if profile.certificate_sha256.is_empty() {
+        // Also check self-signed signatures; merely allowing an unknown issuer
+        // must not allow a cryptographically invalid self-signed certificate.
+        config
+            .param_mut()
+            .set_flags(X509VerifyFlags::CHECK_SS_SIGNATURE)?;
+        let recorded = errors.clone();
+        config.set_verify_callback(SslVerifyMode::PEER, move |verified, context| {
+            if verified {
+                return true;
+            }
+            let error = context.error();
+            if !approvable_verification_error(error.as_raw()) {
+                return false;
+            }
+            let Ok(mut errors) = recorded.lock() else {
+                return false;
+            };
+            let message = format!(
+                "{} (code {}, depth {})",
+                error.error_string(),
+                error.as_raw(),
+                context.error_depth()
+            );
+            if !errors.contains(&message) {
+                if errors.len() >= 32 {
+                    return false;
+                }
+                errors.push(message);
+            }
+            true
+        });
+    } else {
+        // Explicit pins retain the existing exact-leaf identity policy. A
+        // mismatch is fatal even during this credential-free preflight.
+        config.set_verify_hostname(false);
+    }
     let stream = config
         .connect(&profile.host, tcp_connect(profile)?)
-        .map_err(|e| anyhow::anyhow!("TLS discovery failed: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("TLS certificate preflight failed: {e}"))?;
+    verify_pin(&stream, &profile.certificate_sha256)?;
+    verify_negotiated_crypto(&stream, profile)?;
+    let errors = errors
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Certificate verification state failed"))?
+        .clone();
+    Ok((stream, errors))
+}
+
+fn certificate_report(
+    stream: &SslStream<TcpStream>,
+    verification_errors: Vec<String>,
+) -> Result<CertificateReport> {
     let cert = stream
         .ssl()
         .peer_certificate()
         .context("Missing certificate")?;
+    Ok(CertificateReport {
+        certificate_sha256: hex::encode(cert.digest(MessageDigest::sha256())?),
+        subject: format!("{:?}", cert.subject_name()),
+        issuer: format!("{:?}", cert.issuer_name()),
+        not_before: cert.not_before().to_string(),
+        not_after: cert.not_after().to_string(),
+        verification_errors,
+    })
+}
+
+/// Perform TLS only, without application data, credentials, interfaces or routes.
+/// Approved warnings do not change connection policy: callers must obtain user
+/// consent and pin this exact fingerprint in the current connection profile.
+pub fn check_certificate(profile: &Profile) -> Result<CertificateReport> {
+    let (stream, errors) = certificate_stream(profile)?;
+    certificate_report(&stream, errors)
+}
+
+/// Certificate discovery sends no application data or credentials. This is not trust approval.
+pub fn inspect(profile: &Profile) -> Result<serde_json::Value> {
+    let (stream, errors) = certificate_stream(profile)?;
+    let report = certificate_report(&stream, errors)?;
     Ok(serde_json::json!({
         "host": profile.host, "port": profile.port,
-        "certificate_sha256": hex::encode(cert.digest(MessageDigest::sha256())?),
-        "subject": format!("{:?}", cert.subject_name()), "issuer": format!("{:?}", cert.issuer_name()),
-        "not_after": cert.not_after().to_string(), "tls": stream.ssl().version_str(),
+        "certificate_sha256": report.certificate_sha256,
+        "subject": report.subject, "issuer": report.issuer,
+        "not_before": report.not_before, "not_after": report.not_after,
+        "verification_errors": report.verification_errors,
+        "tls": stream.ssl().version_str(),
         "cipher": stream.ssl().current_cipher().map(|c| c.name()),
         "trusted": false,
         "notice": "Discovery only; verify this fingerprint with your VPN administrator before pinning."
@@ -156,5 +259,14 @@ mod tests {
             ..Profile::default()
         };
         assert!(p.validate().is_err());
+    }
+    #[test]
+    fn preflight_never_approves_signature_revocation_or_weak_algorithm_errors() {
+        for code in [7, 8, 13, 14, 23, 26, 28, 66, 67, 68, 77, 78, 79, 999] {
+            assert!(
+                !approvable_verification_error(code),
+                "Hard certificate failure {code} must not become a trust prompt"
+            );
+        }
     }
 }

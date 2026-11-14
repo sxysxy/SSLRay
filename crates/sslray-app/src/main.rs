@@ -1,3 +1,5 @@
+mod certificate_gate;
+mod certificate_ui;
 mod i18n;
 mod profiles;
 mod runtime;

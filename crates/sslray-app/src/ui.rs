@@ -1,3 +1,5 @@
+use crate::certificate_gate::{CertificateApproval, CertificateTarget};
+use crate::certificate_ui::{self, CertificateChoice};
 use crate::i18n::{self, Language, Text as T, text};
 use crate::profiles::ProfileLibrary;
 use crate::runtime::{ConnectionState, Controller, Snapshot};
@@ -8,6 +10,7 @@ use directories::ProjectDirs;
 use eframe::egui::{self, Align, Color32, FontId, RichText, Stroke, Vec2};
 use serde::{Deserialize, Serialize};
 use sslray_core::config::{CryptoMode, Profile, RouteMode, TransportMode, VpnProtocol};
+use sslray_core::crypto::{self, CertificateReport};
 use std::{path::PathBuf, time::Duration};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -226,6 +229,17 @@ impl AdapterDisplay {
     }
 }
 
+struct CertificateQuery {
+    target: CertificateTarget,
+    receiver: std::sync::mpsc::Receiver<std::result::Result<CertificateReport, String>>,
+}
+
+struct CertificateReview {
+    target: CertificateTarget,
+    report: CertificateReport,
+    remember: bool,
+}
+
 struct App {
     controller: Controller,
     profile: Profile,
@@ -259,6 +273,9 @@ struct App {
     authorization_retry: bool,
     pending_password: Option<Zeroizing<String>>,
     pending_otp: Option<Zeroizing<String>>,
+    certificate_query: Option<CertificateQuery>,
+    certificate_review: Option<CertificateReview>,
+    certificate_approval: Option<CertificateApproval>,
 }
 
 pub fn run() -> Result<()> {
@@ -363,6 +380,9 @@ impl App {
             authorization_retry: false,
             pending_password: None,
             pending_otp: None,
+            certificate_query: None,
+            certificate_review: None,
+            certificate_approval: None,
         }
     }
 
@@ -469,23 +489,7 @@ impl App {
                 self.remember_password = false;
             }
         }
-        if self.remember_password {
-            ui.label(
-                RichText::new(text(lang, T::PlaintextPasswordWarning))
-                    .size(12.0)
-                    .color(colors.warning),
-            );
-            if let Some(path) = self.password_storage_path() {
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(path.display().to_string())
-                            .monospace()
-                            .size(12.0),
-                    )
-                    .selectable(true),
-                );
-            }
-        } else if !self.profiles_writable {
+        if !self.profiles_writable {
             ui.label(
                 RichText::new(text(lang, T::SavePasswordUnavailable))
                     .size(12.0)
@@ -572,29 +576,49 @@ impl App {
             let mut close = false;
             let response =
                 egui::Modal::new(egui::Id::new("confirm-plaintext-storage")).show(ctx, |ui| {
-                    ui.set_width(450.0);
-                    ui.label(
-                        RichText::new(text(lang, T::ConfirmSavePassword))
-                            .size(19.0)
-                            .strong(),
-                    );
-                    ui.add_space(10.0);
-                    ui.label(text(lang, T::PlaintextPasswordWarning));
-                    if let Some(path) = self.password_storage_path() {
+                    ui.set_width(480.0);
+                    ui.with_layout(egui::Layout::top_down(Align::Min), |ui| {
                         ui.add(
-                            egui::Label::new(RichText::new(path.display().to_string()).monospace())
-                                .selectable(true),
+                            egui::Label::new(
+                                RichText::new(text(lang, T::ConfirmSavePassword))
+                                    .size(19.0)
+                                    .strong(),
+                            )
+                            .wrap()
+                            .halign(Align::Min),
                         );
-                    }
-                    ui.add_space(14.0);
-                    ui.horizontal(|ui| {
-                        if ui.button(text(lang, T::Cancel)).clicked() {
-                            close = true;
+                        ui.add_space(10.0);
+                        ui.add(
+                            egui::Label::new(text(lang, T::PlaintextPasswordWarning))
+                                .wrap()
+                                .halign(Align::Min),
+                        );
+                        if let Some(path) = self.password_storage_path() {
+                            ui.add_space(8.0);
+                            let mut path_text = egui::text::LayoutJob::simple(
+                                path.display().to_string(),
+                                FontId::monospace(12.0),
+                                ui.visuals().text_color(),
+                                ui.available_width(),
+                            );
+                            path_text.wrap.break_anywhere = true;
+                            ui.add(
+                                egui::Label::new(path_text)
+                                    .wrap()
+                                    .halign(Align::Min)
+                                    .selectable(true),
+                            );
                         }
-                        if ui.button(text(lang, T::Confirm)).clicked() {
-                            self.remember_password = true;
-                            close = true;
-                        }
+                        ui.add_space(14.0);
+                        ui.horizontal(|ui| {
+                            if ui.button(text(lang, T::Cancel)).clicked() {
+                                close = true;
+                            }
+                            if ui.button(text(lang, T::Confirm)).clicked() {
+                                self.remember_password = true;
+                                close = true;
+                            }
+                        });
                     });
                 });
             if close || response.should_close() {
@@ -661,6 +685,7 @@ impl App {
             self.password_dialog = false;
             self.password.zeroize();
             self.show_password = false;
+            self.certificate_approval = None;
         } else if submit {
             self.password_dialog = false;
             self.show_password = false;
@@ -772,6 +797,7 @@ impl App {
         })();
         match result {
             Ok(profiles) => {
+                self.clear_certificate_check();
                 self.password.zeroize();
                 self.otp.zeroize();
                 self.profiles = profiles;
@@ -885,7 +911,7 @@ impl App {
     }
 
     fn connect(&mut self) {
-        if self.busy() {
+        if self.busy() || self.certificate_query.is_some() || self.certificate_review.is_some() {
             return;
         }
         self.show_password = false;
@@ -942,6 +968,22 @@ impl App {
             self.notice = Some(Notice::plain(T::InvalidOtp));
             return;
         }
+        let connection_profile = if self.profile.protocol != VpnProtocol::OpenVpn
+            && self.profile.certificate_sha256.is_empty()
+        {
+            match self.certificate_approval.as_ref().and_then(|approval| {
+                approval.connection_profile(self.profiles.selected_id, &self.profile)
+            }) {
+                Some(profile) => profile,
+                None => {
+                    self.certificate_approval = None;
+                    self.start_certificate_check();
+                    return;
+                }
+            }
+        } else {
+            self.profile.clone()
+        };
         let password = if self.remember_password {
             self.password.clone()
         } else {
@@ -956,7 +998,8 @@ impl App {
         self.pending_password = Some(Zeroizing::new(password.clone()));
         self.pending_otp = otp.as_ref().map(|value| Zeroizing::new(value.clone()));
         self.authorization_retry = false;
-        match self.controller.connect(self.profile.clone(), password, otp) {
+        self.certificate_approval = None;
+        match self.controller.connect(connection_profile, password, otp) {
             Ok(()) => {
                 self.page = Page::Overview;
                 self.notice = None;
@@ -966,6 +1009,140 @@ impl App {
                 self.pending_password = None;
                 self.pending_otp = None;
                 self.notice = Some(Notice::error(T::ConnectFailed, format!("{error:#}")));
+            }
+        }
+    }
+
+    fn clear_certificate_check(&mut self) {
+        self.certificate_query = None;
+        self.certificate_review = None;
+        self.certificate_approval = None;
+    }
+
+    fn start_certificate_check(&mut self) {
+        let target = CertificateTarget::new(self.profiles.selected_id, &self.profile);
+        let mut profile = self.profile.clone();
+        // Certificate discovery never needs account names or login secrets.
+        profile.username.clear();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        self.certificate_query = Some(CertificateQuery { target, receiver });
+        std::thread::spawn(move || {
+            let result = crypto::check_certificate(&profile).map_err(|error| format!("{error:#}"));
+            let _ = sender.send(result);
+        });
+    }
+
+    fn poll_certificate_check(&mut self, ctx: &egui::Context) {
+        let current = CertificateTarget::new(self.profiles.selected_id, &self.profile);
+        if self
+            .certificate_query
+            .as_ref()
+            .is_some_and(|query| query.target != current)
+            || self
+                .certificate_review
+                .as_ref()
+                .is_some_and(|review| review.target != current)
+            || self
+                .certificate_approval
+                .as_ref()
+                .is_some_and(|approval| approval.target != current)
+        {
+            self.clear_certificate_check();
+            return;
+        }
+        let Some(query) = &self.certificate_query else {
+            return;
+        };
+        let result = match query.receiver.try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err(text(self.language, T::CertificateCheckFailed).into())
+            }
+        };
+        let query = self.certificate_query.take().unwrap();
+        match result {
+            Ok(report) if report.verification_errors.is_empty() => {
+                self.certificate_approval = Some(CertificateApproval {
+                    target: query.target,
+                    certificate_sha256: None,
+                });
+                self.connect();
+            }
+            Ok(report) => {
+                self.certificate_review = Some(CertificateReview {
+                    target: query.target,
+                    report,
+                    remember: false,
+                });
+                self.show(ctx);
+            }
+            Err(error) => {
+                self.notice = Some(Notice::error(T::CertificateCheckFailed, error));
+                self.show(ctx);
+            }
+        }
+    }
+
+    fn approve_certificate(&mut self, review: &CertificateReview) -> Result<()> {
+        let approval = CertificateApproval {
+            target: review.target.clone(),
+            certificate_sha256: Some(review.report.certificate_sha256.clone()),
+        };
+        let connection = approval
+            .connection_profile(self.profiles.selected_id, &self.profile)
+            .context("Certificate decision no longer matches the connection profile")?;
+        if review.remember {
+            let previous = std::mem::replace(
+                &mut self.profile.certificate_sha256,
+                connection.certificate_sha256,
+            );
+            if let Err(error) = self.save() {
+                self.profile.certificate_sha256 = previous;
+                return Err(error);
+            }
+            self.certificate_approval = None;
+        } else {
+            self.certificate_approval = Some(approval);
+        }
+        Ok(())
+    }
+
+    fn certificate_dialogs(&mut self, ctx: &egui::Context) {
+        if let Some(query) = &self.certificate_query {
+            if certificate_ui::checking(
+                ctx,
+                self.language,
+                &self.profile.name,
+                &query.target.endpoint(),
+            ) {
+                self.clear_certificate_check();
+            }
+        } else if let Some(review) = &mut self.certificate_review {
+            let choice = certificate_ui::review(
+                ctx,
+                self.language,
+                &self.profile.name,
+                &review.target.endpoint(),
+                &review.report,
+                &mut review.remember,
+            );
+            if let Some(choice) = choice {
+                let review = self.certificate_review.take().unwrap();
+                if matches!(choice, CertificateChoice::Continue)
+                    && review.target
+                        == CertificateTarget::new(self.profiles.selected_id, &self.profile)
+                {
+                    match self.approve_certificate(&review) {
+                        Ok(()) => self.connect(),
+                        Err(error) => {
+                            self.certificate_approval = None;
+                            self.notice = Some(Notice::error(T::CertificateDecisionFailed, error));
+                        }
+                    }
+                } else {
+                    self.certificate_approval = None;
+                }
             }
         }
     }
@@ -985,6 +1162,7 @@ impl App {
     }
 
     fn quit(&mut self, ctx: &egui::Context) {
+        self.clear_certificate_check();
         self.password.zeroize();
         self.otp.zeroize();
         self.controller.shutdown();
@@ -1351,6 +1529,12 @@ impl App {
             self.profile.port,
             self.profile.openvpn_config.clone(),
             self.profile.username.clone(),
+        );
+        let previous_certificate_endpoint = (
+            self.profile.protocol,
+            self.profile.host.clone(),
+            self.profile.port,
+            self.profile.crypto,
         );
         let action_size = Vec2::new(100.0, 32.0);
         action_row(ui, |ui| {
@@ -1793,6 +1977,17 @@ impl App {
             ui.add_space(10.0);
             ui.label(RichText::new(text(lang, T::DisconnectToEdit)).color(colors.muted));
         }
+        if previous_certificate_endpoint
+            != (
+                self.profile.protocol,
+                self.profile.host.clone(),
+                self.profile.port,
+                self.profile.crypto,
+            )
+        {
+            self.clear_certificate_check();
+            self.profile.certificate_sha256.clear();
+        }
         if previous_endpoint
             != (
                 self.profile.protocol,
@@ -2083,6 +2278,7 @@ impl App {
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.controller.poll();
+        self.poll_certificate_check(ctx);
         if self.controller.snapshot().state == ConnectionState::Connected {
             self.pending_password = None;
             self.pending_otp = None;
@@ -2149,7 +2345,10 @@ impl eframe::App for App {
             match action {
                 tray::Action::Show => self.show(ctx),
                 tray::Action::Hide => self.hide(ctx),
-                tray::Action::Disconnect => self.controller.disconnect(),
+                tray::Action::Disconnect => {
+                    self.clear_certificate_check();
+                    self.controller.disconnect();
+                }
                 tray::Action::Quit => self.quit(ctx),
             }
         }
@@ -2158,11 +2357,18 @@ impl eframe::App for App {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 self.hide(ctx);
             } else {
+                self.clear_certificate_check();
                 self.controller.disconnect();
             }
         }
         // egui 0.35 calls logic while hidden, so background status and tray events remain live.
-        ctx.request_repaint_after(Duration::from_millis(if self.busy() { 200 } else { 800 }));
+        ctx.request_repaint_after(Duration::from_millis(
+            if self.busy() || self.certificate_query.is_some() {
+                200
+            } else {
+                800
+            },
+        ));
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -2238,6 +2444,7 @@ impl eframe::App for App {
             });
         self.profile_dialogs(ui.ctx());
         self.credential_dialogs(ui.ctx());
+        self.certificate_dialogs(ui.ctx());
         if self.controller.snapshot().state == ConnectionState::AwaitingOtp {
             let challenge = self
                 .controller
@@ -2683,6 +2890,9 @@ mod tests {
                 authorization_retry: false,
                 pending_password: None,
                 pending_otp: None,
+                certificate_query: None,
+                certificate_review: None,
+                certificate_approval: None,
             })
         }
     }
@@ -2740,6 +2950,209 @@ mod tests {
         assert!(app.password_dialog);
         assert!(!app.controller.is_busy());
         assert!(!app.config_dir.as_ref().unwrap().exists());
+    }
+
+    fn simulated_certificate_report(trusted: bool) -> CertificateReport {
+        CertificateReport {
+            certificate_sha256: "ab".repeat(32),
+            subject: "CN=synthetic-gateway".into(),
+            issuer: "CN=synthetic-issuer".into(),
+            not_before: "Jan 1 00:00:00 2026 GMT".into(),
+            not_after: "Jan 1 00:00:00 2027 GMT".into(),
+            verification_errors: if trusted {
+                vec![]
+            } else {
+                vec!["self-signed certificate (code 18, depth 0)".into()]
+            },
+        }
+    }
+
+    #[test]
+    fn untrusted_certificate_report_requires_review_without_starting_connection() {
+        let mut fixture = TestApp::new();
+        let app = &mut fixture.0;
+        app.profile.username = "synthetic-user".into();
+        app.otp = "123456".into();
+        let target = CertificateTarget::new(app.profiles.selected_id, &app.profile);
+        let report = simulated_certificate_report(false);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        app.certificate_query = Some(CertificateQuery {
+            target: target.clone(),
+            receiver,
+        });
+        sender.send(Ok(report.clone())).unwrap();
+        app.poll_certificate_check(&egui::Context::default());
+        let review = app.certificate_review.as_ref().unwrap();
+        assert_eq!(review.target, target);
+        assert_eq!(review.report, report);
+        assert!(!review.remember);
+        assert!(app.certificate_query.is_none() && app.certificate_approval.is_none());
+        assert!(!app.controller.is_busy() && !app.password_dialog);
+        assert!(app.profile.certificate_sha256.is_empty());
+        assert!(app.password.is_empty());
+        assert_eq!(app.otp, "123456");
+        assert!(app.pending_password.is_none() && app.pending_otp.is_none());
+        assert!(!app.config_dir.as_ref().unwrap().exists());
+    }
+
+    #[test]
+    fn cancelled_certificate_query_cannot_resume_from_a_late_trusted_report() {
+        let mut fixture = TestApp::new();
+        let app = &mut fixture.0;
+        app.profile.username = "synthetic-user".into();
+        let target = CertificateTarget::new(app.profiles.selected_id, &app.profile);
+        let (old_sender, receiver) = std::sync::mpsc::channel();
+        app.certificate_query = Some(CertificateQuery {
+            target: target.clone(),
+            receiver,
+        });
+        app.clear_certificate_check();
+        let (_new_sender, receiver) = std::sync::mpsc::channel();
+        app.certificate_query = Some(CertificateQuery { target, receiver });
+        assert!(
+            old_sender
+                .send(Ok(simulated_certificate_report(true)))
+                .is_err()
+        );
+        app.poll_certificate_check(&egui::Context::default());
+        assert!(app.certificate_query.is_some());
+        assert!(app.certificate_review.is_none() && app.certificate_approval.is_none());
+        assert!(!app.controller.is_busy() && !app.password_dialog);
+        assert!(app.profile.certificate_sha256.is_empty());
+        assert!(app.pending_password.is_none() && app.pending_otp.is_none());
+        assert!(!app.config_dir.as_ref().unwrap().exists());
+    }
+
+    #[test]
+    fn changed_certificate_target_discards_queued_reports_reviews_and_approvals() {
+        for field in ["profile", "host", "pin"] {
+            let mut fixture = TestApp::new();
+            let app = &mut fixture.0;
+            // Even a regression that processes the simulated trusted report
+            // cannot reach the network: the required password is absent.
+            app.profile.username = "synthetic-user".into();
+            let target = CertificateTarget::new(app.profiles.selected_id, &app.profile);
+            let (sender, receiver) = std::sync::mpsc::channel();
+            app.certificate_query = Some(CertificateQuery {
+                target: target.clone(),
+                receiver,
+            });
+            sender.send(Ok(simulated_certificate_report(true))).unwrap();
+            match field {
+                "profile" => {
+                    app.profiles
+                        .insert(Profile {
+                            name: "Another profile".into(),
+                            ..app.profile.clone()
+                        })
+                        .unwrap();
+                }
+                "host" => app.profile.host = "another.example".into(),
+                "pin" => app.profile.certificate_sha256 = "cd".repeat(32),
+                _ => unreachable!(),
+            }
+            let context = egui::Context::default();
+            app.poll_certificate_check(&context);
+            assert!(app.certificate_query.is_none() && app.certificate_review.is_none());
+            assert!(app.certificate_approval.is_none());
+            app.certificate_review = Some(CertificateReview {
+                target: target.clone(),
+                report: simulated_certificate_report(false),
+                remember: false,
+            });
+            app.poll_certificate_check(&context);
+            assert!(app.certificate_review.is_none());
+            app.certificate_approval = Some(CertificateApproval {
+                target,
+                certificate_sha256: Some("ab".repeat(32)),
+            });
+            app.poll_certificate_check(&context);
+            assert!(app.certificate_approval.is_none());
+            assert!(!app.controller.is_busy() && !app.password_dialog);
+            assert!(app.pending_password.is_none() && app.pending_otp.is_none());
+            assert!(!app.config_dir.as_ref().unwrap().exists());
+        }
+    }
+
+    #[test]
+    fn certificate_approval_once_changes_only_the_connection_copy() {
+        let mut fixture = TestApp::new();
+        let app = &mut fixture.0;
+        let before = serde_json::to_value(&app.profile).unwrap();
+        let review = CertificateReview {
+            target: CertificateTarget::new(app.profiles.selected_id, &app.profile),
+            report: simulated_certificate_report(false),
+            remember: false,
+        };
+        app.approve_certificate(&review).unwrap();
+        assert_eq!(serde_json::to_value(&app.profile).unwrap(), before);
+        assert!(app.profiles.selected().profile.certificate_sha256.is_empty());
+        let connection = app.certificate_approval.as_ref().unwrap()
+            .connection_profile(app.profiles.selected_id, &app.profile).unwrap();
+        assert_eq!(connection.certificate_sha256, review.report.certificate_sha256);
+        let mut expected = before;
+        expected["certificate_sha256"] = serde_json::Value::String(
+            review.report.certificate_sha256.clone()
+        );
+        assert_eq!(serde_json::to_value(&connection).unwrap(), expected);
+        assert!(!app.config_dir.as_ref().unwrap().exists());
+        assert!(!app.controller.is_busy());
+        assert!(app.pending_password.is_none() && app.pending_otp.is_none());
+    }
+
+    #[test]
+    fn remembered_certificate_persists_without_unapproved_password_or_otp_storage() {
+        let mut fixture = TestApp::new();
+        let app = &mut fixture.0;
+        app.profile.username = "synthetic-user".into();
+        app.password = "synthetic-main-password-not-saved".into();
+        app.otp = "123456".into();
+        app.use_otp = true;
+        app.remember_password = false;
+        let review = CertificateReview {
+            target: CertificateTarget::new(app.profiles.selected_id, &app.profile),
+            report: simulated_certificate_report(false),
+            remember: true,
+        };
+        app.approve_certificate(&review).unwrap();
+        let loaded = ProfileLibrary::load(app.config_dir.as_ref().unwrap()).unwrap();
+        assert_eq!(loaded.selected_id, app.profiles.selected_id);
+        assert_eq!(loaded.selected().profile.certificate_sha256, review.report.certificate_sha256);
+        assert_eq!(app.profile.certificate_sha256, review.report.certificate_sha256);
+        assert!(loaded.selected().saved_password.is_none());
+        let stored = std::fs::read_to_string(
+            app.config_dir.as_ref().unwrap().join("profiles.json")
+        ).unwrap();
+        assert!(!stored.contains("synthetic-main-password-not-saved"));
+        assert!(!stored.contains("123456"));
+        assert!(!stored.contains("\"saved_password\""));
+        assert!(!stored.contains("\"saved_password_base64\""));
+        assert!(!stored.contains("\"otp\""));
+        assert_eq!(app.password, "synthetic-main-password-not-saved");
+        assert_eq!(app.otp, "123456");
+        assert!(app.certificate_approval.is_none());
+        assert!(!app.controller.is_busy());
+        assert!(app.pending_password.is_none() && app.pending_otp.is_none());
+    }
+
+    #[test]
+    fn remembered_certificate_save_failure_restores_pin_without_connecting() {
+        let mut fixture = TestApp::new();
+        let app = &mut fixture.0;
+        app.profiles_writable = false;
+        let before = serde_json::to_value(&app.profile).unwrap();
+        let review = CertificateReview {
+            target: CertificateTarget::new(app.profiles.selected_id, &app.profile),
+            report: simulated_certificate_report(false),
+            remember: true,
+        };
+        assert!(app.approve_certificate(&review).is_err());
+        assert_eq!(serde_json::to_value(&app.profile).unwrap(), before);
+        assert!(app.profiles.selected().profile.certificate_sha256.is_empty());
+        assert!(app.certificate_approval.is_none());
+        assert!(!app.config_dir.as_ref().unwrap().exists());
+        assert!(!app.controller.is_busy());
+        assert!(app.pending_password.is_none() && app.pending_otp.is_none());
     }
 
     #[test]

@@ -34,11 +34,25 @@ enum Channel {
     Tcp(TcpStream),
 }
 impl Channel {
+    fn set_nonblocking(&self, nonblocking: bool) -> std::io::Result<()> {
+        match self {
+            #[cfg(unix)]
+            Self::Unix(s) => s.set_nonblocking(nonblocking),
+            Self::Tcp(s) => s.set_nonblocking(nonblocking),
+        }
+    }
     fn set_read_timeout(&self, d: Option<Duration>) -> std::io::Result<()> {
         match self {
             #[cfg(unix)]
             Self::Unix(s) => s.set_read_timeout(d),
             Self::Tcp(s) => s.set_read_timeout(d),
+        }
+    }
+    fn read_timeout(&self) -> std::io::Result<Option<Duration>> {
+        match self {
+            #[cfg(unix)]
+            Self::Unix(s) => s.read_timeout(),
+            Self::Tcp(s) => s.read_timeout(),
         }
     }
     fn set_write_timeout(&self, d: Option<Duration>) -> std::io::Result<()> {
@@ -423,6 +437,71 @@ fn read_line_limited(reader: &mut impl BufRead) -> Result<Zeroizing<String>> {
     }
     Ok(Zeroizing::new(String::from_utf8(bytes.to_vec())?))
 }
+
+fn helper_reader(socket: Channel) -> Result<BufReader<Channel>> {
+    // Darwin/BSD can inherit O_NONBLOCK from the listener. Socket timeouts do
+    // not clear it, so normalize every accepted stream before reading/writing.
+    socket
+        .set_nonblocking(false)
+        .context("Configuring privileged helper channel")?;
+    socket.set_read_timeout(Some(Duration::from_millis(250)))?;
+    socket.set_write_timeout(Some(Duration::from_secs(5)))?;
+    Ok(BufReader::new(socket))
+}
+
+fn read_helper_reply(
+    reader: &mut BufReader<Channel>,
+    timeout: Duration,
+    cancel: &AtomicBool,
+) -> Result<Zeroizing<String>> {
+    let deadline = Instant::now() + timeout;
+    ensure!(!cancel.load(Ordering::Relaxed), "Connection cancelled");
+    ensure!(!timeout.is_zero(), "Privileged helper response timed out");
+    let slice = Some(timeout.min(Duration::from_millis(250)));
+    // Avoid resetting the same option between chunks: on Darwin a fully
+    // disconnected peer makes setsockopt fail even with unread bytes queued.
+    if reader.get_ref().read_timeout()? != slice {
+        reader.get_mut().set_read_timeout(slice)?;
+    }
+    let mut bytes = Zeroizing::new(Vec::new());
+    loop {
+        ensure!(!cancel.load(Ordering::Relaxed), "Connection cancelled");
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        ensure!(!remaining.is_zero(), "Privileged helper response timed out");
+        let available = match reader.fill_buf() {
+            Ok(available) => available,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        ensure!(!cancel.load(Ordering::Relaxed), "Connection cancelled");
+        ensure!(
+            Instant::now() < deadline,
+            "Privileged helper response timed out"
+        );
+        ensure!(!available.is_empty(), "Helper channel closed");
+        let n = available
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|n| n + 1)
+            .unwrap_or(available.len());
+        ensure!(bytes.len() + n <= MAX_MESSAGE, "IPC message exceeds limit");
+        bytes.extend_from_slice(&available[..n]);
+        reader.consume(n);
+        if bytes.last() == Some(&b'\n') {
+            return Ok(Zeroizing::new(String::from_utf8(bytes.to_vec())?));
+        }
+    }
+}
+
 fn send_json(writer: &mut impl Write, value: &impl Serialize) -> Result<()> {
     let mut line = Zeroizing::new(serde_json::to_vec(value)?);
     line.push(b'\n');
@@ -475,25 +554,20 @@ impl Drop for HelperChannel {
     }
 }
 impl HelperChannel {
-    fn probe(&mut self) -> Result<()> {
+    fn probe(&mut self, cancel: &AtomicBool) -> Result<()> {
         let mut bytes = [0; 16];
         getrandom::fill(&mut bytes).map_err(|e| anyhow::anyhow!("Creating helper probe: {e}"))?;
         let challenge = hex::encode(bytes);
-        self.reader
-            .get_mut()
-            .set_read_timeout(Some(Duration::from_secs(2)))?;
         send_json(
             self.reader.get_mut(),
             &Control::Probe {
                 challenge: challenge.clone(),
             },
         )?;
-        let line = read_line_limited(&mut self.reader)?;
+        let line = read_helper_reply(&mut self.reader, Duration::from_secs(2), cancel)
+            .context("Checking privileged helper readiness")?;
         let reply: Ready = serde_json::from_str(&line)?;
         ensure!(reply.ready == challenge, "Invalid helper probe response");
-        self.reader
-            .get_mut()
-            .set_read_timeout(Some(Duration::from_millis(250)))?;
         Ok(())
     }
 }
@@ -575,9 +649,13 @@ fn run_client(
         .pool
         .lock()
         .map_err(|_| anyhow::anyhow!("Helper pool lock failed"))?;
-    if pool.as_mut().is_some_and(|helper| helper.probe().is_err()) {
+    if pool
+        .as_mut()
+        .is_some_and(|helper| helper.probe(&cancel).is_err())
+    {
         pool.take();
     }
+    ensure!(!cancel.load(Ordering::Relaxed), "Connection cancelled");
     if pool.is_none() {
         emit(Event::Status {
             message: "Waiting for administrator authorization".into(),
@@ -586,7 +664,7 @@ fn run_client(
         // authentication and later network/IPC failures remain distinct.
         let mut helper = launch_helper(&cancel).context("Administrator authorization failed")?;
         helper
-            .probe()
+            .probe(&cancel)
             .context("Administrator authorization failed")?;
         *pool = Some(helper);
     } else {
@@ -672,10 +750,9 @@ fn launch_helper(cancel: &AtomicBool) -> Result<HelperChannel> {
                 }
                 #[cfg(windows)]
                 let socket = Channel::Tcp(socket);
-                socket.set_read_timeout(Some(Duration::from_secs(2)))?;
-                socket.set_write_timeout(Some(Duration::from_secs(5)))?;
-                let mut reader = BufReader::new(socket);
-                let line = read_line_limited(&mut reader)?;
+                let mut reader = helper_reader(socket)?;
+                let line = read_helper_reply(&mut reader, Duration::from_secs(2), cancel)
+                    .context("Reading privileged helper greeting")?;
                 if line.trim() != expected_token {
                     continue;
                 }
@@ -706,6 +783,11 @@ fn run_remote_session(
     channel
         .get_mut()
         .set_read_timeout(Some(Duration::from_millis(250)))?;
+    ensure!(!cancel.load(Ordering::Relaxed), "Connection cancelled");
+    ensure!(
+        !authority.closed.load(Ordering::Relaxed),
+        "Application is closing"
+    );
     send_json(channel.get_mut(), &Control::Connect { request })?;
     let mut sent_cancel = false;
     let mut partial = Zeroizing::new(Vec::<u8>::new());
@@ -1064,6 +1146,7 @@ mod tests {
             "Administrator authorization failed: Connection cancelled",
             "Administrator authorization failed: Install polkit/pkexec to request administrator privileges",
             "Administrator authorization failed: Administrator authorization/helper failed (exit status: 1): user cancelled",
+            "Administrator authorization failed: Reading privileged helper greeting: Privileged helper response timed out",
             "Administrator authorization timed out",
             "Helper requires administrator privileges",
         ] {
@@ -1206,6 +1289,197 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn accepted_nonblocking_helper_stream_reads_delayed_fragmented_nonce() {
+        let path =
+            std::env::temp_dir().join(format!("sslray-accept-{:016x}", getrandom::u64().unwrap()));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .unwrap();
+        let guard = SocketGuard(path);
+        let endpoint = guard.0.join("helper.sock");
+        let listener = UnixListener::bind(&endpoint).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (connected_tx, connected_rx) = mpsc::channel();
+        let (start_tx, start_rx) = mpsc::channel();
+        let writer = thread::spawn(move || {
+            let mut peer = UnixStream::connect(endpoint).unwrap();
+            peer.set_write_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            connected_tx.send(()).unwrap();
+            start_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            thread::sleep(Duration::from_millis(25));
+            peer.write_all(b"synthetic-").unwrap();
+            thread::sleep(Duration::from_millis(350));
+            peer.write_all(b"nonce\n").unwrap();
+        });
+        connected_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        let (mut stream, _) = listener.accept().unwrap();
+        // Darwin inherits this flag; explicitly set it so Linux also exercises
+        // the production normalization instead of hiding the regression.
+        stream.set_nonblocking(true).unwrap();
+        assert_eq!(
+            stream.read(&mut [0]).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        let mut reader = helper_reader(Channel::Unix(stream)).unwrap();
+        let Channel::Unix(stream) = reader.get_ref() else {
+            unreachable!()
+        };
+        let stream_flags = unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_GETFL) };
+        assert!(stream_flags >= 0);
+        assert_eq!(stream_flags & libc::O_NONBLOCK, 0);
+        let listener_flags = unsafe { libc::fcntl(listener.as_raw_fd(), libc::F_GETFL) };
+        assert!(listener_flags >= 0);
+        assert_ne!(listener_flags & libc::O_NONBLOCK, 0);
+        start_tx.send(()).unwrap();
+        let reply = read_helper_reply(&mut reader, Duration::from_secs(3), &AtomicBool::new(false))
+            .unwrap();
+        assert_eq!(reply.as_str(), "synthetic-nonce\n");
+        writer.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fragmented_probe_ready_survives_read_slice_timeout_and_is_reusable() {
+        let (mut client, server) = pair();
+        let worker = thread::spawn(move || {
+            server
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut reader = BufReader::new(server);
+            for attempt in 0..2 {
+                let line = read_line_limited(&mut reader).unwrap();
+                let Control::Probe { challenge } = serde_json::from_str(&line).unwrap() else {
+                    panic!("expected a readiness probe");
+                };
+                let mut response = serde_json::to_vec(&Ready { ready: challenge }).unwrap();
+                response.push(b'\n');
+                let split = response.len() / 2;
+                reader.get_mut().write_all(&response[..split]).unwrap();
+                if attempt == 0 {
+                    thread::sleep(Duration::from_millis(350));
+                }
+                reader.get_mut().write_all(&response[split..]).unwrap();
+            }
+        });
+        let cancel = AtomicBool::new(false);
+        client.probe(&cancel).unwrap();
+        client.probe(&cancel).unwrap();
+        worker.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn helper_reply_uses_total_deadline_instead_of_returning_raw_would_block() {
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let mut reader = helper_reader(Channel::Unix(stream)).unwrap();
+        let started = Instant::now();
+        let error = read_helper_reply(
+            &mut reader,
+            Duration::from_millis(40),
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "Privileged helper response timed out");
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn helper_reply_cancellation_handles_initial_and_pending_reads_without_echo() {
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        let mut reader = helper_reader(Channel::Unix(stream)).unwrap();
+        let cancel = Arc::new(AtomicBool::new(true));
+        let error = read_helper_reply(&mut reader, Duration::from_secs(3), &cancel).unwrap_err();
+        assert_eq!(error.to_string(), "Connection cancelled");
+        cancel.store(false, Ordering::Relaxed);
+        let fragment = "synthetic-sensitive-fragment";
+        peer.write_all(fragment.as_bytes()).unwrap();
+        let worker_cancel = cancel.clone();
+        let worker = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(40));
+            worker_cancel.store(true, Ordering::Relaxed);
+        });
+        let started = Instant::now();
+        let error = read_helper_reply(&mut reader, Duration::from_secs(3), &cancel).unwrap_err();
+        assert_eq!(error.to_string(), "Connection cancelled");
+        assert!(!format!("{error:#}").contains(fragment));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        worker.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn helper_reply_eof_and_size_limit_do_not_echo_partial_contents() {
+        let fragment = "synthetic-sensitive-fragment";
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        let mut reader = helper_reader(Channel::Unix(stream)).unwrap();
+        peer.write_all(fragment.as_bytes()).unwrap();
+        peer.shutdown(std::net::Shutdown::Write).unwrap();
+        let cancel = AtomicBool::new(false);
+        let error = read_helper_reply(&mut reader, Duration::from_secs(3), &cancel).unwrap_err();
+        assert_eq!(error.to_string(), "Helper channel closed");
+        assert!(!format!("{error:#}").contains(fragment));
+
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        let mut reader = helper_reader(Channel::Unix(stream)).unwrap();
+        let writer = thread::spawn(move || {
+            peer.set_write_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut bytes = vec![b'x'; MAX_MESSAGE + 1];
+            bytes[..fragment.len()].copy_from_slice(fragment.as_bytes());
+            bytes[MAX_MESSAGE] = b'\n';
+            peer.write_all(&bytes).unwrap();
+        });
+        let error = read_helper_reply(&mut reader, Duration::from_secs(3), &cancel).unwrap_err();
+        assert_eq!(error.to_string(), "IPC message exceeds limit");
+        assert!(!format!("{error:#}").contains(fragment));
+        writer.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancelled_or_closed_session_does_not_send_connect_or_credentials() {
+        for (cancelled, closed, expected) in [
+            (true, false, "Connection cancelled"),
+            (false, true, "Application is closing"),
+        ] {
+            let (mut helper, mut peer) = pair();
+            peer.set_read_timeout(Some(Duration::from_millis(40)))
+                .unwrap();
+            let authority = Authority::default();
+            authority.closed.store(closed, Ordering::Relaxed);
+            let cancel = AtomicBool::new(cancelled);
+            let (_otp_tx, otp_rx) = mpsc::channel();
+            let mut events = Vec::new();
+            let error = run_remote_session(
+                &mut helper,
+                Request {
+                    profile: Profile::default(),
+                    password: "synthetic-never-sent-password".into(),
+                    otp: Some("123456".into()),
+                },
+                &cancel,
+                &otp_rx,
+                &authority,
+                &mut |event| events.push(event),
+            )
+            .unwrap_err();
+            assert_eq!(error.to_string(), expected);
+            assert!(events.is_empty());
+            // Keep both endpoints alive: EOF would not prove that Connect
+            // (including the credentials) had never been transmitted.
+            let error = peer.read(&mut [0]).unwrap_err();
+            assert!(matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ));
+        }
+    }
+
+    #[cfg(unix)]
     fn pair() -> (HelperChannel, Channel) {
         let (client, server) = UnixStream::pair().unwrap();
         client
@@ -1281,7 +1555,7 @@ mod tests {
             count
         });
         for index in 0..2 {
-            client.probe().unwrap();
+            client.probe(&AtomicBool::new(false)).unwrap();
             let profile = Profile {
                 name: format!("Profile {index}"),
                 ..Profile::default()
@@ -1346,7 +1620,7 @@ mod tests {
             let _ = result;
             count
         });
-        client.probe().unwrap();
+        client.probe(&AtomicBool::new(false)).unwrap();
         let connect = || Control::Connect {
             request: Request {
                 profile: Profile::default(),
@@ -1375,7 +1649,7 @@ mod tests {
             });
             // Join means the helper itself expired and closed its reader.
             worker.join().unwrap().unwrap();
-            assert!(client.probe().is_err());
+            assert!(client.probe(&AtomicBool::new(false)).is_err());
         }
     }
 
@@ -1400,7 +1674,7 @@ mod tests {
                 },
             )
         });
-        client.probe().unwrap();
+        client.probe(&AtomicBool::new(false)).unwrap();
         send_json(
             client.reader.get_mut(),
             &Control::Connect {
