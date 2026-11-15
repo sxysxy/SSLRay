@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stage a verified GPL source release; archive only when --archive is explicit.
+"""Stage a verified GPL source release under SSLRay/; archive only explicitly.
 
 Uses the working-tree bytes of tracked and unignored new source files, not a
 commit-only export. Requires the separately verified, public OpenSSL checkout
@@ -323,7 +323,7 @@ def verify_tree(tree):
 
 def prepare(stage, openssl_archive, patterns, vendor_home=None):
     version = tomllib.loads((ROOT / "Cargo.toml").read_text())["workspace"]["package"]["version"]
-    tree = stage / f"SSLRay-{version}-source"
+    tree = stage / "SSLRay"
     if stage.is_symlink() or not stage.resolve().is_relative_to((ROOT / "work").resolve()):
         raise ValueError("Generated staging directory must be inside this project's work/")
     stage.mkdir(parents=True, exist_ok=True)
@@ -366,7 +366,7 @@ def prepare(stage, openssl_archive, patterns, vendor_home=None):
     source_epoch = int(os.environ.get("SOURCE_DATE_EPOCH", command(["git", "show", "-s", "--format=%ct", "HEAD"])))
     if source_epoch < 0:
         raise ValueError("Invalid SOURCE_DATE_EPOCH")
-    release = {"project": "SSLRay", "version": version, "license": "GPL-3.0-or-later",
+    release = {"project": "SSLRay", "version": version, "archive_root": tree.name, "license": "GPL-3.0-or-later",
                "additional_permission": "LICENSE-WINTUN-EXCEPTION", "working_tree_export": True,
                "base_commit": command(["git", "rev-parse", "HEAD"]), "source_date_epoch": source_epoch,
                "main_source_files": copied, "sensitive_content_scan": scan,
@@ -391,7 +391,7 @@ def prepare(stage, openssl_archive, patterns, vendor_home=None):
                     or oct(stat.S_IMODE(path.stat().st_mode)) != entry["mode"])):
             raise ValueError(f"Source changed during staging: {name}")
     entries = inventory(tree)
-    report = {"stage": str(tree), "status": "prepared_only", "main_source_files": len(copied),
+    report = {"stage": str(tree), "archive_root": tree.name, "status": "prepared_only", "main_source_files": len(copied),
               "staged_entries": len(entries),
               "staged_file_bytes": sum(e.get("bytes", 0) for e in entries.values()),
               "source_inventory_sha256": digest(tree / "SOURCE-INVENTORY.json"),

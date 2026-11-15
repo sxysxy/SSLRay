@@ -71,9 +71,17 @@ core 中的 `RouteGuard` 仅以 `add` 安装路由，不清空或替换系统路
 
 主密码/OTP/会话密钥使用 `zeroize` 尽力清理，无法保证系统换页和库内部缓冲全部擦除。保存到本地的内容不上传云端，但需保护文件和备份。软件设置仅按本次会话的精确接口名查询，不显示其他适配器；未连接时不查询，最终断开确认后清空。Unix 使用 `getifaddrs` 和 MTU 查询，Windows 使用固定 PowerShell/.NET 查询（5 秒、1 MiB 上限）；异步结果校验会话代数，防止同名重连显示旧数据。查询失败仅显示本会话已知信息，并区分配置 MTU 与实测值。
 
+## 发行包目录
+
+版本、平台和架构保留在外层发行文件名中。Windows ZIP、Linux tar.gz 和完整源码 tar.gz 解压后均为单一 `SSLRay/` 根目录；Windows 入口是 `SSLRay/SSLRay.exe`，Linux 入口是 `SSLRay/SSLRay`，源码构建命令在展开后的 `SSLRay/` 内执行。源码包包含固定 OpenSSL 及锁定的 Cargo vendor 依赖和离线配置，Rust 工具链、系统 SDK 与原生构建工具另行准备。
+
+macOS 发布文件为 `SSLRay-<版本>-macos-<架构>.dmg`，卷名为 `SSLRay`，可见内容为 `SSLRay.app` 和指向 `/Applications` 的 `Applications` 快捷方式。打开映像后可将应用拖入“应用程序”。目录和容器命名不改变应用的签名、公证或运行验收状态。
+
 ## macOS 构建与打包
 
 初始化官方 [OpenSSL 子模块](../third_party/openssl)后，用 [cargo-macos.sh](../scripts/cargo-macos.sh) 运行 Cargo；[bundle-macos.sh](../scripts/bundle-macos.sh)共享相同配置。构建固定源码版本的静态库，缓存于 `work/`，不在子模块内生成构建文件，不使用 Homebrew OpenSSL。源版本和许可证见[第三方说明](THIRD-PARTY.md)。
+
+`bundle-macos.sh [输出目录]` 默认生成 `dist/SSLRay.app` 与 `dist/SSLRay-<版本>-macos-<架构>.dmg`。独立入口 `package-dmg-macos.sh APP_PATH OUTPUT_DMG` 可将已有已签名应用打入映像，不重新编译或修改应用文件；映像以只读方式挂载，核对应用文件及 `Applications -> /Applications` 结构。
 
 默认 `MACOSX_DEPLOYMENT_TARGET=11.0`，主程序及 TLS 库均按同一目标编译、检查 Mach-O 要求；打包拒绝非系统动态依赖，`Info.plist` 仍从实际二进制计算下限。`SSLRAY_MACOS_ARCH` 可选择 `arm64` 或 `x86_64`（需对应 Rust target）；当前仅构建验证 Apple Silicon，旧系统和 Intel 运行仍待实测。[Rust 平台要求](https://doc.rust-lang.org/rustc/platform-support/apple-darwin.html)允许 arm64 以 11.0 为目标。
 

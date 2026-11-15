@@ -23,7 +23,7 @@ git submodule update --init third_party/openssl
 ./scripts/cargo-macos.sh run -p sslray --locked
 ```
 
-The complete source archive contains OpenSSL; its Git initialization step can be skipped.
+The complete source archive extracts to `SSLRay/` and includes OpenSSL and the locked Cargo dependencies with an offline configuration. Run the commands from that directory; skip Git initialization. The Rust toolchain, SDKs and native build tools are still required.
 
 Build a macOS development bundle with the same backend:
 
@@ -32,13 +32,15 @@ Build a macOS development bundle with the same backend:
 open dist/SSLRay.app
 ```
 
-The script collects licenses, includes the shared application icon, and applies an ad-hoc signature. The default Apple Silicon deployment target is macOS 11.0; older systems still require runtime validation. Public macOS distribution additionally needs Developer ID signing and notarization.
+The script collects licenses, includes the shared application icon, applies an ad-hoc signature, and creates a DMG. An optional first argument selects the output directory (default `dist`). The default Apple Silicon deployment target is macOS 11.0; older systems still require runtime validation. Public macOS distribution additionally needs Developer ID signing and notarization.
 
 | Platform | Cargo wrapper | Packaging |
 | --- | --- | --- |
-| macOS | `scripts/cargo-macos.sh` | `scripts/bundle-macos.sh` → `.app` |
-| Linux | `scripts/cargo-linux.sh` | [Linux build](docs/LINUX-BUILD.md) → `.tar.gz` |
-| Windows x64 | `scripts/cargo-windows.ps1` | [Windows build](docs/WINDOWS-BUILD.md) → ZIP with the official Wintun DLL |
+| macOS | `scripts/cargo-macos.sh` | `SSLRay-<version>-macos-arm64.dmg`: `SSLRay.app` and an Applications shortcut |
+| Linux | `scripts/cargo-linux.sh` | [Linux build](docs/LINUX-BUILD.md): `SSLRay-<version>-linux-x86_64.tar.gz` → `SSLRay/` |
+| Windows x64 | `scripts/cargo-windows.ps1` | [Windows build](docs/WINDOWS-BUILD.md): `SSLRay-<version>-windows-x64.zip` → `SSLRay/`, including the official Wintun DLL |
+
+Open the macOS DMG and drag `SSLRay.app` to Applications. After extraction, launch `SSLRay/SSLRay` on Linux or `SSLRay/SSLRay.exe` on Windows. The source archive is `SSLRay-<version>-source.tar.gz`, also with a single `SSLRay/` root. Version, platform and architecture stay in distribution filenames; extracted application/source directories have stable names.
 
 ## Connect
 

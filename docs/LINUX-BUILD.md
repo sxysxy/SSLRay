@@ -14,7 +14,7 @@ git submodule update --init third_party/openssl
 
 构建入口固定设置本次进程的 `OPENSSL_DIR`、`OPENSSL_STATIC`、target 对应变量及实际许可源码目录。OpenSSL 位于 `work/openssl-linux-x86_64-glibc2.28/install`，Cargo 默认输出到 `work/linux-x86_64-glibc2.28-target`。每次重新核对固定源码与 SM4 TLS 1.3 能力；实际主程序通过 `readelf` 检查 x86_64、最高 GLIBC 符号、不含动态 OpenSSL 与构建机绝对 RPATH。
 
-`bundle-linux.sh [输出目录]` 默认生成 `dist/SSLRay-<版本>-linux-x86_64/` 及 `.tar.gz`。包含启动器、二进制、SVG 图标、desktop 模板、项目的 LICENSE/COPYRIGHT/附加许可、第三方许可、ELF/加密能力记录与 SHA-256。打包后解压对比全部文件；已有同名版本时拒绝覆盖。
+`bundle-linux.sh [输出目录]` 默认生成 `dist/SSLRay/` 和 `dist/SSLRay-<版本>-linux-x86_64.tar.gz`。归档只有一个 `SSLRay/` 根目录，解压后运行 `SSLRay/SSLRay`。包含启动器、二进制、SVG 图标、desktop 模板、项目的 LICENSE/COPYRIGHT/附加许可、第三方许可、ELF/加密能力记录与 SHA-256。打包后解压对比全部文件；已有同名输出时拒绝覆盖。
 
 这是使用系统 GUI 运行库的 tar 包。GTK 3、X11/Wayland、OpenGL、glibc 2.28+ 由目标系统提供；托盘需 Ayatana AppIndicator 或兼容 AppIndicator 库及桌面支持。连接需 `/dev/net/tun`、iproute2、polkit/pkexec 与桌面认证代理。CLI 在无显示环境中可运行；连接仍需合法的系统提权方式。解压和启动应用不会自动安装服务或 desktop 文件，不会自动保存密码或连接 VPN。
 

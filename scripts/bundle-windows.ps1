@@ -65,15 +65,16 @@ if (-not $OutputDirectory) { $OutputDirectory = Join-Path $settings.Project 'dis
 New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
 $OutputDirectory = (Resolve-Path -LiteralPath $OutputDirectory).Path
 $name = "SSLRay-$version-windows-x64"
-$destination = Join-Path $OutputDirectory $name
+$packageName = 'SSLRay'
+$destination = Join-Path $OutputDirectory $packageName
 $zip = Join-Path $OutputDirectory "$name.zip"
 if ((Test-Path -LiteralPath $destination) -or (Test-Path -LiteralPath $zip)) { throw 'Versioned output already exists; choose an empty output directory' }
 $stage = Join-Path $settings.Project ("work\windows-release-stage-" + [Guid]::NewGuid().ToString('N'))
-$package = Join-Path $stage $name
+$package = Join-Path $stage $packageName
 $stagedZip = Join-Path $stage "$name.zip"
 New-Item -ItemType Directory -Path $package | Out-Null
 try {
-    Copy-Item -LiteralPath $exe -Destination (Join-Path $package 'sslray.exe')
+    Copy-Item -LiteralPath $exe -Destination (Join-Path $package 'SSLRay.exe')
     Copy-Item -LiteralPath $wintun -Destination (Join-Path $package 'wintun.dll')
     Copy-Item -LiteralPath $wintunLicense -Destination (Join-Path $package 'WINTUN-LICENSE.txt')
     if ((Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $package 'wintun.dll')).Hash.ToLowerInvariant() -ne $wintunHash) { throw 'Copied Wintun DLL hash mismatch' }
@@ -102,8 +103,8 @@ try {
     Write-Utf8File (Join-Path $package 'build-info.json') ($buildInfo | ConvertTo-Json -Depth 14)
     Write-Utf8File (Join-Path $package 'README.txt') @"
 SSLRay $version - Windows x64
-Keep sslray.exe and the original wintun.dll in the same protected directory.
-This packager does not sign sslray.exe. Actual Authenticode status: $($exeSignature.Status).
+Keep SSLRay.exe and the original wintun.dll in the same protected directory.
+This packager does not sign SSLRay.exe. Actual Authenticode status: $($exeSignature.Status).
 Wintun 0.14.1 AMD64 is hash-checked and its signature was Valid on this machine.
 The application requests elevation through Windows UAC only when connecting.
 OpenSSL is static, GM-enabled, compiled without assembly and with static CRT.
@@ -111,20 +112,20 @@ ThirdPartyLicenses/INDEX.json records the exact local notice collection scope an
 This build/packaging check does not itself test a VPN, UAC, routes or Wintun adapter creation.
 "@
     $sums = @(Get-ChildItem -LiteralPath $package -File -Recurse | Sort-Object FullName | ForEach-Object {
-        '{0}  {1}' -f (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant(), $_.FullName.Substring($package.Length + 1).Replace('\','/')
+        '{0}  {1}' -f (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant(), $_.FullName.Substring($package.Length + 1).Replace([char]92, [char]47)
     })
     Write-Utf8File (Join-Path $package 'SHA256SUMS.txt') (($sums -join "`n") + "`n")
     Compress-Archive -LiteralPath $package -DestinationPath $stagedZip -CompressionLevel Optimal
     $verify = Join-Path $stage 'verify'
     Expand-Archive -LiteralPath $stagedZip -DestinationPath $verify
     foreach ($file in Get-ChildItem -LiteralPath $package -File -Recurse) {
-        $copy = Join-Path (Join-Path $verify $name) $file.FullName.Substring($package.Length + 1)
+        $copy = Join-Path (Join-Path $verify $packageName) $file.FullName.Substring($package.Length + 1)
         if ((Get-FileHash -Algorithm SHA256 -LiteralPath $file.FullName).Hash -ne (Get-FileHash -Algorithm SHA256 -LiteralPath $copy).Hash) { throw 'ZIP extraction content mismatch' }
     }
     Move-Item -LiteralPath $package -Destination $destination
     Move-Item -LiteralPath $stagedZip -Destination $zip
     $zipHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash.ToLowerInvariant()
-    Write-Utf8File (Join-Path $OutputDirectory "$name.sha256") ("$zipHash  $name.zip`n")
+    Write-Utf8File (Join-Path $OutputDirectory "$name.zip.sha256") ("$zipHash  $name.zip`n")
     Write-Host "Built $destination"
     Write-Host "ZIP $zip"
     Write-Host "SHA256 $zipHash"

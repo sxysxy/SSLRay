@@ -14,13 +14,14 @@ output=${1:-$project_root/dist}
 mkdir -p "$output"
 output=$(CDPATH= cd "$output" && pwd)
 name="SSLRay-$version-linux-x86_64"
-[ ! -e "$output/$name" ] && [ ! -e "$output/$name.tar.gz" ] || { printf 'Versioned output already exists\n' >&2; exit 1; }
+package_name=SSLRay
+[ ! -e "$output/$package_name" ] && [ ! -e "$output/$name.tar.gz" ] || { printf 'Release output already exists\n' >&2; exit 1; }
 stage=$(mktemp -d "$project_root/work/linux-bundle.XXXXXXXX")
 trap 'rm -rf "$stage"' EXIT
 trap 'exit 1' HUP INT TERM
-package="$stage/$name"
+package="$stage/$package_name"
 mkdir -p "$package/bin" "$package/share/icons/hicolor/scalable/apps" "$package/share/applications"
-cp "$binary" "$package/bin/sslray"
+cp "$binary" "$package/bin/SSLRay"
 cp "$project_root/assets/sslray.svg" "$package/share/icons/hicolor/scalable/apps/sslray.svg"
 for notice in LICENSE COPYRIGHT LICENSE-WINTUN-EXCEPTION; do
   cp "$project_root/$notice" "$package/$notice"
@@ -29,9 +30,9 @@ cat > "$package/SSLRay" <<'LAUNCHER'
 #!/bin/sh
 set -eu
 app_dir=$(CDPATH= cd "$(dirname "$0")" && pwd)
-exec "$app_dir/bin/sslray" "$@"
+exec "$app_dir/bin/SSLRay" "$@"
 LAUNCHER
-chmod +x "$package/SSLRay" "$package/bin/sslray"
+chmod +x "$package/SSLRay" "$package/bin/SSLRay"
 cat > "$package/share/applications/tech.sslray.client.desktop" <<'DESKTOP'
 [Desktop Entry]
 Type=Application
@@ -49,7 +50,12 @@ import json,sys
 data=json.load(open(sys.argv[1]))
 assert data['gm_tls13'] and data['backend'].startswith('OpenSSL ')
 CHECK
-cp "$tls_root/app-elf-validation.json" "$package/elf-validation.json"
+python3 - "$tls_root/app-elf-validation.json" "$package/elf-validation.json" <<'ELFINFO'
+import json,sys
+from pathlib import Path
+data=json.loads(Path(sys.argv[1]).read_text());data['file']='SSLRay'
+Path(sys.argv[2]).write_text(json.dumps(data,indent=2)+'\n')
+ELFINFO
 cp "$tls_root/build-settings.txt" "$package/tls-build-settings.txt"
 python3 - "$package/build-info.json" <<'BUILDINFO'
 import hashlib,json,platform,subprocess,sys
@@ -82,11 +88,11 @@ from pathlib import Path
 root=Path(sys.argv[1]); paths=sorted(p for p in root.rglob('*') if p.is_file())
 (root/'SHA256SUMS.txt').write_text(''.join(hashlib.sha256(p.read_bytes()).hexdigest()+'  '+p.relative_to(root).as_posix()+'\n' for p in paths))
 HASHES
-tar -C "$stage" -czf "$stage/$name.tar.gz" "$name"
+tar -C "$stage" -czf "$stage/$name.tar.gz" "$package_name"
 mkdir "$stage/unpacked"
 tar -C "$stage/unpacked" -xzf "$stage/$name.tar.gz"
-diff -r "$package" "$stage/unpacked/$name"
-mv "$package" "$output/$name"
+diff -r "$package" "$stage/unpacked/$package_name"
+mv "$package" "$output/$package_name"
 mv "$stage/$name.tar.gz" "$output/$name.tar.gz"
 (cd "$output" && sha256sum "$name.tar.gz") > "$output/$name.tar.gz.sha256"
 printf 'Built %s\n' "$output/$name.tar.gz"

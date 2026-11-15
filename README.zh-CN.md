@@ -23,7 +23,7 @@ git submodule update --init third_party/openssl
 ./scripts/cargo-macos.sh run -p sslray --locked
 ```
 
-完整源码归档已包含 OpenSSL，可跳过 Git 初始化步骤。
+完整源码归档解压为 `SSLRay/`，已包含 OpenSSL、锁定版本的 Cargo 依赖和离线配置。在此目录执行构建命令，可跳过 Git 初始化；Rust 工具链、系统 SDK 和原生构建工具仍需自行准备。
 
 使用相同后端构建 macOS 开发包：
 
@@ -32,13 +32,15 @@ git submodule update --init third_party/openssl
 open dist/SSLRay.app
 ```
 
-脚本收集许可证、加入统一应用图标并做 ad-hoc 签名。Apple Silicon 默认部署目标为 macOS 11.0，旧系统仍待实机验证；公开分发还需 Developer ID 签名与公证。
+脚本收集许可证、加入统一应用图标、做 ad-hoc 签名并生成 DMG；可用第一个参数选择输出目录，默认 `dist`。Apple Silicon 默认部署目标为 macOS 11.0，旧系统仍待实机验证；公开分发还需 Developer ID 签名与公证。
 
 | 平台 | Cargo 包装脚本 | 打包 |
 | --- | --- | --- |
-| macOS | `scripts/cargo-macos.sh` | `scripts/bundle-macos.sh` → `.app` |
-| Linux | `scripts/cargo-linux.sh` | [Linux 构建](docs/LINUX-BUILD.md) → `.tar.gz` |
-| Windows x64 | `scripts/cargo-windows.ps1` | [Windows 构建](docs/WINDOWS-BUILD.md) → 含官方 Wintun DLL 的 ZIP |
+| macOS | `scripts/cargo-macos.sh` | `SSLRay-<版本>-macos-arm64.dmg`，内含 `SSLRay.app` 和“应用程序”快捷方式 |
+| Linux | `scripts/cargo-linux.sh` | [Linux 构建](docs/LINUX-BUILD.md)：`SSLRay-<版本>-linux-x86_64.tar.gz` → `SSLRay/` |
+| Windows x64 | `scripts/cargo-windows.ps1` | [Windows 构建](docs/WINDOWS-BUILD.md)：`SSLRay-<版本>-windows-x64.zip` → `SSLRay/`，含官方 Wintun DLL |
+
+macOS 打开 DMG 后，将 `SSLRay.app` 拖入“应用程序”。解压后，Linux 运行 `SSLRay/SSLRay`，Windows 运行 `SSLRay/SSLRay.exe`。源码包名为 `SSLRay-<版本>-source.tar.gz`，也只有一个 `SSLRay/` 根目录。版本、平台和架构保留在发行文件名中，解压后的应用和源码目录使用固定名称。
 
 ## 使用
 

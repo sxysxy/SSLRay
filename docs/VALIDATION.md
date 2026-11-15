@@ -6,13 +6,17 @@
 
 | 平台 | 构建与回归 | 已验证运行范围 | 边界 |
 | --- | --- | --- | --- |
-| macOS arm64 | **174 通过、4 忽略**；fmt、全 targets Clippy `-D warnings` 通过 | `.app`、CLI 0.1.0、统一图标、静态 OpenSSL 4.0.3、国密能力检查、ZIP 重解压 440 文件及权限一致 | 目标 macOS 11.0，未在旧系统或 Intel 实机运行；ad-hoc 签名，未公证，Gatekeeper 不接受其为已认证分发 |
+| macOS arm64 | **174 通过、4 忽略**；fmt、全 targets Clippy `-D warnings` 通过 | `.app`、CLI 0.1.0、统一图标、静态 OpenSSL 4.0.3、国密能力检查；DMG 只读挂载后应用 440 文件、含根目录的 713 项及权限一致，严格签名校验通过 | 目标 macOS 11.0，未在旧系统或 Intel 实机运行；ad-hoc 签名，未公证，Gatekeeper 不接受其为已认证分发 |
 | Linux x86_64 | **164 通过、4 忽略**；全 targets Clippy `-D warnings` 通过，最终 UI 的 73 项 app 测试与严格 Clippy 再次通过 | manylinux 2.28 构建、Ubuntu 原生启动；最终 CLI 经显式 sudo 建立宿主 TUN、仅测试目标 `/32`，OpenVPN 参考服务 ping 2/2 及清理通过；另有隔离命名空间 TUN 测试 | ELF 最高要求 GLIBC 2.28；此前 Xvfb 界面截图未在最后日志布局修正后重拍；桌面托盘及 polkit 人工交互未验收，企业网关数据仍未通过 |
 | Windows x64 | **158 通过、4 忽略**；全 targets Clippy `-D warnings`、原生 release、静态 CRT/OpenSSL、官方 Wintun 0.14.1 哈希与 Authenticode 检查通过 | 真实 UAC、官方 Wintun、VIP/MTU、受限 `/32`、OpenVPN 参考服务 ICMP、断开清理及同一管理员 helper 重连复用通过；日志列表可见，深色英文检查后恢复中文浅色并退出 | 本次主机及证书认证/UDP 组合的实测，不代表其他 Windows 版本、硬件、全部 OpenVPN 选项或企业华为网关已通过 |
 
 三端平台包装脚本使用固定的项目 OpenSSL 源码，运行不需要系统 OpenSSL。macOS 动态导入仅含 Apple 系统库；Linux 无动态 `libssl` / `libcrypto` 和绝对 RPATH。Windows 已修复读超时使 OpenSSL 会话永久失效的问题，回归覆盖连续超时后恢复收包、分片及 EOF；仅看到 `gm_tls13=true` 仍不代表实际国密网关握手通过。
 
 应用与核心的非测试代码禁止直接 `unwrap` / `expect`。回归覆盖证书预检与指纹、OTP、Base64 凭据隔离、Profile、路由事务、helper 复用、i18n、布局和错误摘要。短负认证响应保留网关状态码，不再误报为系统读取超时；完整短信挑战与不自动重复登录的策略不变。新增 3 项 OpenVPN 回归覆盖忽略完整 IPv6 数据后继续 IPv4 会话、有限读取预算，以及继续拒绝损坏的 IPv4/IPv6 和非 IP 数据；这不提供 IPv6 接入或路由。
+
+## 发行布局
+
+外层文件名保留版本、平台与架构。Windows ZIP、Linux tar.gz 和完整源码 tar.gz 的解压根目录统一为 `SSLRay/`。macOS 使用 DMG，卷名 `SSLRay`，根部可见 `SSLRay.app` 及指向 `/Applications` 的快捷方式；本地开发仍可直接启动 `.app`。实际只读挂载确认这两个可见项及链接目标正确，应用内容与目录权限保持原样，`codesign --verify --deep --strict` 通过，并确认映像已卸载。新独立输出目录和将已有已签名应用单独打入 DMG 的入口均通过；拒绝向应用包内部写入输出的检查也已实测，源应用未改变。容器调整未重跑或扩大上述运行测试范围；重新打包的文件与容器校验见发行文件旁的独立记录。
 
 ## 网络与授权范围
 

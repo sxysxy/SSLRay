@@ -10,7 +10,7 @@
 git -c core.autocrlf=false submodule update --init third_party/openssl
 ```
 
-只初始化顶层子模块即可，不需要其可选测试仓库。Windows 校验器从固定 Git commit/tree 取得文件模式与 blob 清单，逐文件核对实际原始内容，并拒绝新增生成文件。由于 NTFS 不保留 POSIX 执行位，此入口要求 OpenSSL 的 Git 元数据；没有 `.git` 的源码导出应先取得固定子模块 checkout。校验失败时脚本不会更改或修复源码。
+只初始化顶层子模块即可，不需要其可选测试仓库。Windows 校验器从固定 Git commit/tree 取得文件模式与 blob 清单，逐文件核对实际原始内容，并拒绝新增生成文件。由于 NTFS 不保留 POSIX 执行位，此入口要求 OpenSSL 的 Git 元数据。本项目完整源码归档解压为 `SSLRay/`，已包含所需 OpenSSL 公开浅 Git 数据、锁定的 Cargo 依赖及离线配置，可跳过初始化步骤；其它没有 `.git` 的源码导出应先取得固定子模块 checkout。校验失败时脚本不会更改或修复源码。
 
 以下使用示例工具路径，按实际安装位置替换：
 
@@ -37,6 +37,6 @@ Cargo 入口配置本次进程的 `OPENSSL_DIR`、`OPENSSL_STATIC=1` 及对应 t
 
 打包读取 workspace 版本，核对 CLI 版本/加密能力，拒绝动态 OpenSSL 与 VC/UCRT 运行库导入。Wintun 必须是 [0.14.1 官方来源记录](../third_party/wintun/README.md) 中的原始 AMD64 DLL；DLL 与许可证都按固定 SHA-256 核验，并检查 DLL 的 PE 架构与本机 Authenticode 验证结果。脚本不下载 Wintun，也不替换它的原始签名。
 
-输出为 `dist/SSLRay-<版本>-windows-x64/` 和同名 ZIP（可用 `-OutputDirectory` 指定新目录），含 `sslray.exe`、`wintun.dll`、Wintun 原始许可、项目及实际缓存依赖的通知、构建记录和 SHA-256。ZIP 解压后逐文件对比；已有同名版本输出时拒绝覆盖。通知收集器的范围与缺项在 `ThirdPartyLicenses/INDEX.json` 中明确列出。
+输出为 `dist/SSLRay/` 和 `dist/SSLRay-<版本>-windows-x64.zip`（可用 `-OutputDirectory` 指定新目录）。ZIP 只有一个 `SSLRay/` 根目录，解压后运行 `SSLRay/SSLRay.exe`；同目录含 `wintun.dll`、Wintun 原始许可、项目及实际依赖的通知、构建记录和 SHA-256。ZIP 解压后逐文件对比；已有同名输出时拒绝覆盖。通知收集器的范围与缺项在 `ThirdPartyLicenses/INDEX.json` 中明确列出。
 
 脚本不签署客户端 EXE；实际签名状态写入 `build-info.json` 和 README。Wintun 的官方签名不代表客户端 EXE 已签名。构建、静态依赖、能力和打包检查不代表完成了 UAC、Wintun 创建、真实 VPN 及路由清理的实机验收；后者应单独记录。
