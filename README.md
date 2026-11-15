@@ -44,7 +44,7 @@ Profiles can be duplicated, renamed, or deleted; switching prompts you to handle
 
 Main passwords are not saved by default. Enabling **Save main password locally** stores **Base64** in local `profiles.json`; the confirmation shows its full path. Base64 is reversible, not encryption, and the stored configuration is not uploaded to the cloud. **OTPs are never saved.** See [system and configuration details](docs/PLATFORMS.md) for migration, permissions, and routing policies.
 
-Legacy Huawei CHIV3 UDP is opt-in and uses AES-128-CBC without a per-packet MAC. Auto keeps TLS for these gateways. GM TLS mode never falls back to standard algorithms or uses an AES UDP data channel.
+Standard mode automatically negotiates legacy Huawei CHIV3 UDP when available; Auto returns to TLS if negotiation fails. CHIV3 uses AES-128-CBC without a per-packet MAC; TLS remains selectable. GM uses TLS and never downgrades its algorithms.
 
 ## Command line
 

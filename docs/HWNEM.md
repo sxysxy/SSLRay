@@ -34,7 +34,7 @@ Legacy SMS is triggered specifically by a big-endian `u16 == 1` at authenticatio
 
 ## Legacy CHIV UDP
 
-Legacy Auto defaults to TLS; explicit UDP additionally requires `allow_legacy_udp`. CHIV uses **AES-128-CBC without a packet authentication tag** and exposes the inner IPv4 header. Source filtering and IV deduplication do not provide cryptographic integrity; the UI labels this transport accordingly.
+After legacy protocol detection, standard-cryptography Auto and explicit UDP negotiate CHIV mode `3` automatically. The old JSON field `allow_legacy_udp` remains readable but no longer controls negotiation; the profile is not changed. TLS selection and strict GM mode do not attempt legacy UDP. CHIV uses **AES-128-CBC without a packet authentication tag** and exposes the inner IPv4 header. Source filtering and IV deduplication do not provide cryptographic integrity; the UI labels this transport accordingly.
 
 Over TLS, send command `13` with payload `00 00 00 04`, requiring response mode `00 00 00 03` and a 16-byte key. Then send command `26` with the same payload to obtain the UDP port. UDP uses the verified TLS peer's IP and the negotiated port.
 
@@ -53,7 +53,7 @@ The plaintext IPv4 total length determines the valid decrypted length. Business 
 
 The connection probe places NEM command `14` inside a synthetic IPv4 packet. Within three seconds it must receive an ACK that decrypts to the exact NEM magic and command `15`. This synthetic packet has a specific quirk: the native client byte-swaps the already-network-order result of `inet_addr()` again, reversing the destination bytes of the TLS peer's IPv4 address. The stored native gateway string has already been resolved to a numeric IP. **Business IP packets are not byte-swapped, and synthetic ACK addresses are not validated against the VIP.**
 
-The TLS control channel continues keepalives and processes session termination. Static-IV mode `2` is rejected; CHIV is not a GM cryptography data plane.
+The TLS control channel continues keepalives and processes session termination. Static-IV mode `2` is rejected. In Auto, unavailable CHIV negotiation or a failed UDP probe sends empty command `16` on the same authenticated NEM TLS connection and continues with TLS; the native switch does not require an ACK. Late outstanding key/port replies and an optional switch reply are drained once each. Explicit UDP reports failure. Invalid framing, TLS/identity errors and session termination remain fatal, with no repeated password authentication. CHIV is not a GM cryptography data plane.
 
 ## NEM v1: authentication and TLS data
 

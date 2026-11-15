@@ -9,7 +9,7 @@ use serde::{
     de::Error as _,
     ser::{Error as _, SerializeStruct},
 };
-use sslray_core::config::{Profile, RouteMode};
+use sslray_core::config::{CryptoMode, Profile, RouteMode, TransportMode, VpnProtocol};
 use std::{
     collections::HashSet,
     fs::{self, File, OpenOptions},
@@ -224,11 +224,11 @@ impl ProfileLibrary {
         result
     }
 
-    pub fn selected(&self) -> &ProfileEntry {
+    pub fn selected(&self) -> Result<&ProfileEntry> {
         self.entries
             .iter()
             .find(|entry| entry.id == self.selected_id)
-            .expect("profile library selection is validated before use")
+            .context("Selected connection profile is missing from the profile library")
     }
 
     pub fn select(&mut self, id: u64) -> Result<()> {
@@ -333,9 +333,12 @@ impl ProfileLibrary {
     }
 
     pub fn is_current_profile(&self, profile: &Profile) -> bool {
+        let Ok(selected) = self.selected() else {
+            return false;
+        };
         serde_json::to_vec(profile)
             .ok()
-            .zip(serde_json::to_vec(&self.selected().profile).ok())
+            .zip(serde_json::to_vec(&selected.profile).ok())
             .is_some_and(|(draft, saved)| draft == saved)
     }
 
@@ -394,6 +397,15 @@ fn normalize(profile: &mut Profile) {
     profile.name = profile.name.trim().to_owned();
     profile.route_mode = profile.effective_route_mode();
     profile.use_server_routes = profile.route_mode != RouteMode::ManualOnly;
+    // Older GUI versions saved this combination. Preserve the chosen GM
+    // cryptography and migrate only its incompatible transport in memory.
+    // OpenVPN has never supported GM and must still fail normal validation.
+    if profile.protocol != VpnProtocol::OpenVpn
+        && profile.crypto == CryptoMode::GmTls13
+        && profile.transport == TransportMode::Udp
+    {
+        profile.transport = TransportMode::Tls;
+    }
 }
 
 fn validate_profile(profile: &Profile) -> Result<()> {
@@ -470,6 +482,67 @@ mod tests {
     }
 
     #[test]
+    fn missing_selection_returns_a_business_error_without_selecting_another_profile() {
+        let mut library = ProfileLibrary::default();
+        library
+            .insert(Profile {
+                name: "Another account".into(),
+                username: "synthetic-other-user".into(),
+                ..Profile::default()
+            })
+            .unwrap();
+        let ids: Vec<_> = library.entries.iter().map(|entry| entry.id).collect();
+        library.selected_id = u64::MAX;
+
+        let error = library.selected().err().unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("Selected connection profile is missing")
+        );
+        assert_eq!(library.selected_id, u64::MAX);
+        assert_eq!(
+            library
+                .entries
+                .iter()
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>(),
+            ids
+        );
+        assert!(!library.is_current_profile(&Profile::default()));
+    }
+
+    #[test]
+    fn legacy_gm_udp_loads_as_gm_tls_without_rewriting_until_save() {
+        let directory = TestDirectory::new();
+        let path = directory.0.join(LIBRARY_FILE);
+        let mut old = ProfileLibrary::default();
+        old.entries[0].profile.crypto = CryptoMode::GmTls13;
+        old.entries[0].profile.transport = TransportMode::Udp;
+        let original = serde_json::to_vec_pretty(&old).unwrap();
+        fs::write(&path, &original).unwrap();
+
+        let migrated = ProfileLibrary::load(&directory.0).unwrap();
+        assert_eq!(
+            migrated.selected().unwrap().profile.crypto,
+            CryptoMode::GmTls13
+        );
+        assert_eq!(
+            migrated.selected().unwrap().profile.transport,
+            TransportMode::Tls
+        );
+        assert_eq!(fs::read(&path).unwrap(), original);
+        migrated.save(&directory.0).unwrap();
+        assert_ne!(fs::read(&path).unwrap(), original);
+
+        old.entries[0].profile.protocol = VpnProtocol::OpenVpn;
+        let unsupported = serde_json::to_vec_pretty(&old).unwrap();
+        fs::write(&path, &unsupported).unwrap();
+        assert!(ProfileLibrary::load(&directory.0).is_err());
+        assert_eq!(fs::read(&path).unwrap(), unsupported);
+    }
+
+    #[test]
     fn independent_profiles_and_selection_survive_roundtrip() {
         let directory = TestDirectory::new();
         let mut library = ProfileLibrary::default();
@@ -488,12 +561,18 @@ mod tests {
         library.save(&directory.0).unwrap();
         let mut loaded = ProfileLibrary::load(&directory.0).unwrap();
         assert_eq!(loaded.selected_id, second);
-        assert_eq!(loaded.selected().profile.protocol, VpnProtocol::Cisco);
-        assert_eq!(loaded.selected().profile.routes, ["192.0.2.0/24"]);
+        assert_eq!(
+            loaded.selected().unwrap().profile.protocol,
+            VpnProtocol::Cisco
+        );
+        assert_eq!(loaded.selected().unwrap().profile.routes, ["192.0.2.0/24"]);
         loaded.select(1).unwrap();
-        assert_eq!(loaded.selected().profile.protocol, VpnProtocol::Huawei);
-        assert!(loaded.selected().profile.routes.is_empty());
-        assert!(loaded.selected().profile.username.is_empty());
+        assert_eq!(
+            loaded.selected().unwrap().profile.protocol,
+            VpnProtocol::Huawei
+        );
+        assert!(loaded.selected().unwrap().profile.routes.is_empty());
+        assert!(loaded.selected().unwrap().profile.username.is_empty());
         loaded.save(&directory.0).unwrap();
         assert_eq!(ProfileLibrary::load(&directory.0).unwrap().selected_id, 1);
     }
@@ -501,10 +580,10 @@ mod tests {
     #[test]
     fn renaming_checks_names_and_keeps_identity() {
         let mut library = ProfileLibrary::default();
-        let mut profile = library.selected().profile.clone();
+        let mut profile = library.selected().unwrap().profile.clone();
         profile.name = "  办公网  ".into();
         library.update_selected(profile).unwrap();
-        assert_eq!(library.selected().profile.name, "办公网");
+        assert_eq!(library.selected().unwrap().profile.name, "办公网");
         assert_eq!(library.selected_id, 1);
         let name = library.unique_name("办公网");
         assert_eq!(name, "办公网 (2)");
@@ -514,11 +593,11 @@ mod tests {
                 ..Profile::default()
             })
             .unwrap();
-        let mut collision = library.selected().profile.clone();
+        let mut collision = library.selected().unwrap().profile.clone();
         collision.name = "办公网".into();
         assert!(library.update_selected(collision).is_err());
         assert_eq!(library.selected_id, id);
-        assert_eq!(library.selected().profile.name, "办公网 (2)");
+        assert_eq!(library.selected().unwrap().profile.name, "办公网 (2)");
         assert!(
             library
                 .insert(Profile {
@@ -571,7 +650,10 @@ mod tests {
         let original = serde_json::to_vec_pretty(&profile).unwrap();
         fs::write(directory.0.join("profile.json"), &original).unwrap();
         let mut library = ProfileLibrary::load(&directory.0).unwrap();
-        assert_eq!(library.selected().profile.route_mode, RouteMode::ManualOnly);
+        assert_eq!(
+            library.selected().unwrap().profile.route_mode,
+            RouteMode::ManualOnly
+        );
         assert_eq!(
             fs::read(directory.0.join("profile.json")).unwrap(),
             original
@@ -587,6 +669,7 @@ mod tests {
             ProfileLibrary::load(&directory.0)
                 .unwrap()
                 .selected()
+                .unwrap()
                 .profile
                 .name,
             "New name"
@@ -617,7 +700,7 @@ mod tests {
     #[test]
     fn drafts_are_detected_and_prepared_private_material_is_rejected() {
         let mut library = ProfileLibrary::default();
-        let mut draft = library.selected().profile.clone();
+        let mut draft = library.selected().unwrap().profile.clone();
         assert!(library.is_current_profile(&draft));
         draft.host = "changed.example.com".into();
         assert!(!library.is_current_profile(&draft));
@@ -625,7 +708,7 @@ mod tests {
         let private = Profile {
             protocol: VpnProtocol::OpenVpn,
             openvpn_config: "sslray-openvpn-v1:private-material".into(),
-            ..library.selected().profile.clone()
+            ..library.selected().unwrap().profile.clone()
         };
         assert!(library.update_selected(private).is_err());
         let directory = TestDirectory::new();
@@ -639,7 +722,7 @@ mod tests {
     fn passwords_are_opt_in_per_profile_and_can_be_forgotten() {
         let directory = TestDirectory::new();
         let mut library = ProfileLibrary::default();
-        assert!(library.selected().saved_password.is_none());
+        assert!(library.selected().unwrap().saved_password.is_none());
         library.save(&directory.0).unwrap();
         assert!(
             !fs::read_to_string(directory.0.join(LIBRARY_FILE))
@@ -655,29 +738,37 @@ mod tests {
         assert!(!json.contains("\"saved_password\""));
         assert!(json.contains("\"saved_password_base64\""));
         let mut loaded = ProfileLibrary::load(&directory.0).unwrap();
-        assert!(loaded.selected().saved_password.as_deref() == Some("synthetic-test-password"));
+        assert!(
+            loaded.selected().unwrap().saved_password.as_deref() == Some("synthetic-test-password")
+        );
         loaded
             .insert(Profile {
                 name: "Second".into(),
                 ..Profile::default()
             })
             .unwrap();
-        assert!(loaded.selected().saved_password.is_none());
+        assert!(loaded.selected().unwrap().saved_password.is_none());
         let second_id = loaded.selected_id;
         loaded
             .set_saved_password(Some("second-synthetic-password".into()))
             .unwrap();
         loaded.save(&directory.0).unwrap();
         loaded = ProfileLibrary::load(&directory.0).unwrap();
-        assert!(loaded.selected().saved_password.as_deref() == Some("second-synthetic-password"));
+        assert!(
+            loaded.selected().unwrap().saved_password.as_deref()
+                == Some("second-synthetic-password")
+        );
         loaded.select(1).unwrap();
-        assert!(loaded.selected().saved_password.as_deref() == Some("synthetic-test-password"));
+        assert!(
+            loaded.selected().unwrap().saved_password.as_deref() == Some("synthetic-test-password")
+        );
         loaded.set_saved_password(None).unwrap();
         loaded.save(&directory.0).unwrap();
         assert!(
             ProfileLibrary::load(&directory.0)
                 .unwrap()
                 .selected()
+                .unwrap()
                 .saved_password
                 .is_none()
         );
@@ -685,7 +776,10 @@ mod tests {
         assert!(!json.contains("synthetic-test-password"));
         assert!(!json.contains("second-synthetic-password"));
         loaded.select(second_id).unwrap();
-        assert!(loaded.selected().saved_password.as_deref() == Some("second-synthetic-password"));
+        assert!(
+            loaded.selected().unwrap().saved_password.as_deref()
+                == Some("second-synthetic-password")
+        );
     }
 
     #[test]
@@ -695,7 +789,9 @@ mod tests {
         let original = br#"{"version":1,"selected_id":1,"entries":[{"id":1,"profile":{},"saved_password":"old-synthetic-password"}]}"#;
         fs::write(&path, original).unwrap();
         let library = ProfileLibrary::load(&directory.0).unwrap();
-        assert!(library.selected().saved_password.as_deref() == Some("old-synthetic-password"));
+        assert!(
+            library.selected().unwrap().saved_password.as_deref() == Some("old-synthetic-password")
+        );
         assert!(fs::read(&path).unwrap() == original);
         library.save(&directory.0).unwrap();
         let serialized = fs::read_to_string(&path).unwrap();
@@ -703,7 +799,9 @@ mod tests {
         assert!(!serialized.contains("\"saved_password\""));
         assert!(serialized.contains("\"saved_password_base64\""));
         let loaded = ProfileLibrary::load(&directory.0).unwrap();
-        assert!(loaded.selected().saved_password.as_deref() == Some("old-synthetic-password"));
+        assert!(
+            loaded.selected().unwrap().saved_password.as_deref() == Some("old-synthetic-password")
+        );
     }
 
     #[test]
@@ -750,7 +848,9 @@ mod tests {
             library.set_saved_password(Some(password.clone())).unwrap();
             library.save(&directory.0).unwrap();
             let loaded = ProfileLibrary::load(&directory.0).unwrap();
-            assert!(loaded.selected().saved_password.as_deref() == Some(password.as_str()));
+            assert!(
+                loaded.selected().unwrap().saved_password.as_deref() == Some(password.as_str())
+            );
             let json = fs::read_to_string(directory.0.join(LIBRARY_FILE)).unwrap();
             assert!(!json.contains(&password));
         }
@@ -765,7 +865,8 @@ mod tests {
         for password in [String::new(), "x".repeat(1025), "bad\0value".into()] {
             assert!(library.set_saved_password(Some(password)).is_err());
             assert!(
-                library.selected().saved_password.as_deref() == Some("synthetic-test-password")
+                library.selected().unwrap().saved_password.as_deref()
+                    == Some("synthetic-test-password")
             );
         }
     }

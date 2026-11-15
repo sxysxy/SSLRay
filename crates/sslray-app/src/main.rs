@@ -1,5 +1,9 @@
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+
 mod certificate_gate;
 mod certificate_ui;
+mod diagnostics;
+mod error_ui;
 mod i18n;
 mod profiles;
 mod runtime;

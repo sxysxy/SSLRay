@@ -673,7 +673,8 @@ fn run_client(
         });
     }
     let result = run_remote_session(
-        pool.as_mut().unwrap(),
+        pool.as_mut()
+            .context("Privileged helper unavailable after authorization")?,
         request,
         &cancel,
         &otp_rx,

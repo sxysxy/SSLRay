@@ -87,7 +87,7 @@ fn build(
             context.request_repaint();
         }
     }));
-    let rgba = icon_rgba(32);
+    let rgba = icon_rgba(32)?;
     let icon = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_icon(Icon::from_rgba(rgba, 32, 32)?)
@@ -167,11 +167,11 @@ impl Tray {
 
 /// Load antialiased artwork rendered from assets/sslray.svg. The tray (32 px)
 /// and window (64 px) use exact-size PNGs; other sizes retain this helper's API.
-pub fn icon_rgba(size: u32) -> Vec<u8> {
+pub fn icon_rgba(size: u32) -> Result<Vec<u8>> {
     if size == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    assert!(size <= 1024, "Icon size must not exceed the 1024px source");
+    anyhow::ensure!(size <= 1024, "Icon size must not exceed the 1024px source");
     let png: &[u8] = match size {
         16 => include_bytes!("../../../assets/icons/sslray-16.png"),
         20 => include_bytes!("../../../assets/icons/sslray-20.png"),
@@ -185,9 +185,10 @@ pub fn icon_rgba(size: u32) -> Vec<u8> {
         512 => include_bytes!("../../../assets/icons/sslray-512.png"),
         _ => include_bytes!("../../../assets/icons/sslray-1024.png"),
     };
-    let icon = eframe::icon_data::from_png_bytes(png).expect("Invalid bundled SSLRay icon PNG");
+    let icon = eframe::icon_data::from_png_bytes(png)
+        .context("Loading the bundled SSLRay application icon")?;
     if icon.width == size {
-        return icon.rgba;
+        return Ok(icon.rgba);
     }
 
     // Bilinear sampling in premultiplied alpha avoids a dark fringe where the
@@ -229,5 +230,5 @@ pub fn icon_rgba(size: u32) -> Vec<u8> {
             rgba[offset + 3] = channels[3].round() as u8;
         }
     }
-    rgba
+    Ok(rgba)
 }

@@ -17,8 +17,10 @@ fn escape(value: &str) -> Zeroizing<String> {
         if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
             out.push(b as char);
         } else {
-            use std::fmt::Write;
-            write!(&mut *out, "%{b:02X}").unwrap();
+            const HEX: &[u8; 16] = b"0123456789ABCDEF";
+            out.push('%');
+            out.push(HEX[(b >> 4) as usize] as char);
+            out.push(HEX[(b & 0x0f) as usize] as char);
         }
     }
     out
@@ -100,18 +102,19 @@ fn read_body(stream: &mut SslStream<TcpStream>) -> Result<Zeroizing<Vec<u8>>> {
     }
     bail!("Unsupported native Huawei authentication framing")
 }
-fn u32_at(body: &[u8], at: usize) -> u32 {
-    u32::from_be_bytes(
-        body[at..at + 4]
-            .try_into()
-            .expect("fixed bounded auth structure"),
-    )
+fn u32_at(body: &[u8], at: usize) -> Result<u32> {
+    let bytes = body
+        .get(at..at.saturating_add(4))
+        .context("Truncated native Huawei authentication field")?;
+    Ok(u32::from_be_bytes(bytes.try_into().map_err(|_| {
+        anyhow::anyhow!("Invalid native Huawei authentication field length")
+    })?))
 }
 fn sms_required(body: &[u8]) -> bool {
     u16::from_be_bytes([body[0x32], body[0x33]]) == 1
 }
 fn auth_fields(body: &[u8]) -> Result<LegacyAuth> {
-    let user_id = u32_at(body, 0x28);
+    let user_id = u32_at(body, 0x28)?;
     ensure!(
         user_id != 0 && user_id != u32::MAX,
         "Native Huawei gateway did not authenticate the session"
@@ -135,20 +138,20 @@ fn auth_fields(body: &[u8]) -> Result<LegacyAuth> {
     );
     Ok(LegacyAuth {
         user_id,
-        random_id: u32_at(body, 8),
+        random_id: u32_at(body, 8)?,
         native_auth: true,
-        vtid: u32_at(body, 4),
+        vtid: u32_at(body, 4)?,
         cookie,
     })
 }
 fn finish_auth(body: &[u8]) -> Result<LegacyAuth> {
-    let status = u32_at(body, 0) as i32;
+    let status = u32_at(body, 0)? as i32;
     ensure!(
         status >= 0 || matches!(status, -11 | -12),
         "Native Huawei gateway rejected authentication (status {status}); no automatic retry"
     );
     ensure!(
-        u32_at(body, 0x18) != 1,
+        u32_at(body, 0x18)? != 1,
         "Native Huawei gateway requires HostID device authentication; this is a separate, unsupported device challenge"
     );
     auth_fields(body)

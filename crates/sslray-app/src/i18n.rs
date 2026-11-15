@@ -69,6 +69,8 @@ catalog! {
     AuthorizationLinuxHelp => ("Linux 使用 polkit / pkexec，需要桌面认证代理；无图形代理时请在终端运行。", "Linux uses polkit / pkexec and requires a desktop authentication agent; use the terminal if no graphical agent is available."),
     AuthorizationMacHelp => ("macOS 使用系统管理员授权弹窗。", "macOS uses the system administrator authorization dialog."),
     Logs => ("运行日志", "Session log"),
+    TechnicalDetails => ("技术详情", "Technical details"),
+    CopyErrorDetails => ("复制错误详情", "Copy error details"),
     HideToTray => ("收起到系统托盘  ↗", "Hide to system tray  ↗"),
     DesktopClient => ("桌面客户端", "DESKTOP CLIENT"),
     Connected => ("已安全连接", "Securely connected"),
@@ -179,10 +181,10 @@ catalog! {
     StandardTls => ("标准 TLS", "Standard TLS"),
     GmOption => ("国密 TLS 1.3 · SM2 / SM3 / SM4", "GM TLS 1.3 · SM2 / SM3 / SM4"),
     GmTooltip => ("需要兼容的加密后端与网关共同支持国密 TLS 1.3。", "Requires GM TLS 1.3 support in both the linked cryptographic backend and the gateway."),
-    AllowLegacyUdp => ("允许旧版华为 UDP 兼容模式（实验性）", "Allow legacy Huawei UDP compatibility (experimental)"),
-    LegacyUdpTooltip => ("旧版 CHIV UDP 使用 AES-128-CBC，但没有逐包 MAC。本兼容模式仅允许 CHIV3，不使用默认 IV 的 CHIV2。默认关闭；自适应模式遇到旧版网关时保持 TLS。GCMv1 的认证传输不受此选项影响。", "Legacy CHIV UDP uses AES-128-CBC without a per-datagram MAC. Compatibility permits CHIV3 only, never default-IV CHIV2. Disabled by default: adaptive mode keeps TLS for legacy gateways. Authenticated GCMv1 is unaffected."),
-    LegacyUdpWarning => ("已允许旧版 CHIV3 / AES-128-CBC UDP。该华为协议缺少数据报 MAC，无法提供逐包完整性认证。关闭此选项可继续使用 TLS；GCMv1 的认证模式不受影响。", "Legacy CHIV3 / AES-128-CBC UDP is enabled. This Huawei protocol has no datagram MAC and cannot authenticate each packet’s integrity. Disable it to retain TLS; authenticated GCMv1 is unaffected."),
-    TransportCryptoHelp => ("自适应优先认证 UDP，失败时回退 TLS，默认对旧版网关保持 TLS。国密配置需要兼容的加密后端与网关共同支持，不会自动降级。", "Adaptive mode prefers authenticated UDP, falls back to TLS, and keeps TLS for legacy gateways by default. GM requires a compatible backend and gateway; it never silently downgrades."),
+    LegacyUdpAutoHelp => ("自动识别网关并协商 UDP 兼容方式；自适应模式下不可用时切回 TLS。", "Gateway and UDP compatibility are detected automatically; adaptive mode returns to TLS when UDP is unavailable."),
+    GmTransportHelp => ("国密模式使用 TLS 传输，不使用 AES UDP，也不会降级加密算法。", "GM mode uses TLS transport, excludes AES UDP, and does not downgrade its cryptography."),
+    LegacyUdpWarning => ("当前连接使用旧版 UDP，不提供逐包完整性校验；如需更强保护，可选择 TLS 传输。", "This connection uses legacy UDP without per-packet integrity checks. Select TLS transport for stronger protection."),
+    TransportCryptoHelp => ("自适应优先可用的 UDP，失败时回退 TLS。国密配置需要后端与网关共同支持，仅使用 TLS，不会降级算法。", "Adaptive prefers available UDP and falls back to TLS. GM requires support from both backend and gateway, uses TLS only, and never downgrades algorithms."),
     CryptoBackend => ("当前加密后端", "Cryptographic backend"),
     Available => ("可用", "available"),
     Unavailable => ("不可用", "unavailable"),
@@ -232,6 +234,10 @@ catalog! {
     NoAdvertisedRoutes => ("网关未下发 IPv4 路由。", "The gateway advertised no IPv4 routes."),
     NoAppliedRoutes => ("当前会话没有生效的 IPv4 路由。", "No IPv4 routes were applied in this session."),
     SessionEvents => ("会话事件", "Session events"),
+    LogList => ("事件列表", "Event list"),
+    LogDetail => ("事件详情", "Event details"),
+    SelectLog => ("选择一条事件查看详情。", "Select an event to view its details."),
+    LogDiagnosticEvent => ("诊断信息", "Diagnostic information"),
     CopyLogs => ("复制日志", "Copy log"),
     LogsHelp => ("连接状态与诊断信息，密码和 OTP 不记录。", "Connection status and diagnostics. Passwords and OTPs are not logged."),
     NoEvents => ("暂无会话事件", "No session events"),
@@ -283,12 +289,33 @@ catalog! {
     StatusCreatingRoutes => ("正在创建虚拟网卡，分流路由数量", "Creating virtual interface; split route count"),
     StatusSkippedUnsupported => ("已跳过不支持的网关路由", "Skipped unsupported server route"),
     StatusSkippedGatewayRoute => ("已跳过覆盖公网 VPN 网关的服务器路由", "Skipped server route covering outer VPN gateway"),
+    StatusLegacyDetected => ("已识别旧版华为网关协议", "Legacy Huawei gateway detected"),
+    StatusLegacyNegotiating => ("正在协商兼容 UDP 传输", "Negotiating compatible UDP transport"),
+    StatusLegacyEstablished => ("兼容 UDP 传输已建立", "Compatible UDP transport established"),
+    StatusLegacyFallback => ("兼容 UDP 不可用，正在切回 TLS", "Compatible UDP unavailable; returning to TLS"),
+    StatusLegacyTls => ("已选择 TLS 传输", "TLS transport selected"),
+    StatusGmTlsOnly => ("国密策略使用 TLS 传输", "GM policy uses TLS transport"),
 }
 
 /// Localize messages emitted by our core/runtime while preserving unknown server
 /// diagnostics. The raw source log is retained by the controller.
 pub fn diagnostic<'a>(language: Language, message: &'a str) -> Cow<'a, str> {
+    known_diagnostic(language, message).unwrap_or(Cow::Borrowed(message))
+}
+
+/// Recognize our messages independently of whether their translation happens
+/// to equal the original English text. Unknown gateway text stays separate.
+pub fn known_diagnostic(language: Language, message: &str) -> Option<Cow<'_, str>> {
     let id = match message {
+        "Huawei legacy protocol detected" => Some(Text::StatusLegacyDetected),
+        "Negotiating Huawei legacy CHIV UDP" => Some(Text::StatusLegacyNegotiating),
+        "Huawei legacy CHIV UDP established" => Some(Text::StatusLegacyEstablished),
+        "Huawei legacy UDP unavailable; switching to TLS" => Some(Text::StatusLegacyFallback),
+        "Huawei legacy TLS selected" => Some(Text::StatusLegacyTls),
+        "GM TLS policy excludes legacy UDP" => Some(Text::StatusGmTlsOnly),
+        "Strict GM TLS mode cannot use AES UDP transport; select TLS or Auto" => {
+            Some(Text::GmTransportHelp)
+        }
         "Cannot locate the application configuration directory" => {
             Some(Text::ConfigDirectoryUnavailable)
         }
@@ -339,7 +366,7 @@ pub fn diagnostic<'a>(language: Language, message: &'a str) -> Cow<'a, str> {
         _ => None,
     };
     if let Some(id) = id {
-        return Cow::Borrowed(text(language, id));
+        return Some(Cow::Borrowed(text(language, id)));
     }
     for (prefix, id) in [
         ("Connected over ", Text::StatusConnectedOver),
@@ -350,28 +377,28 @@ pub fn diagnostic<'a>(language: Language, message: &'a str) -> Cow<'a, str> {
         ),
     ] {
         if let Some(value) = message.strip_prefix(prefix) {
-            return Cow::Owned(format!("{}: {value}", text(language, id)));
+            return Some(Cow::Owned(format!("{}: {value}", text(language, id))));
         }
     }
     if let Some(count) = message
         .strip_prefix("Creating virtual interface with ")
         .and_then(|s| s.strip_suffix(" split routes"))
     {
-        return Cow::Owned(format!(
+        return Some(Cow::Owned(format!(
             "{}: {count}",
             text(language, Text::StatusCreatingRoutes)
-        ));
+        )));
     }
     if let Some(route) = message
         .strip_prefix("Skipped server route ")
         .and_then(|s| s.strip_suffix(" covering outer VPN gateway"))
     {
-        return Cow::Owned(format!(
+        return Some(Cow::Owned(format!(
             "{}: {route}",
             text(language, Text::StatusSkippedGatewayRoute)
-        ));
+        )));
     }
-    Cow::Borrowed(message)
+    None
 }
 
 #[cfg(test)]
@@ -399,5 +426,17 @@ mod tests {
             diagnostic(Language::ZhCn, "server error 0x42"),
             "server error 0x42"
         );
+    }
+
+    #[test]
+    fn known_english_messages_are_recognized_even_without_changed_text() {
+        for language in [Language::ZhCn, Language::En] {
+            let known = known_diagnostic(language, "Authenticating with Huawei NEM gateway");
+            assert_eq!(
+                known.as_deref(),
+                Some(text(language, Text::StatusAuthenticating))
+            );
+            assert!(known_diagnostic(language, "server error 0x42").is_none());
+        }
     }
 }

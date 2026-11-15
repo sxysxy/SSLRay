@@ -112,7 +112,11 @@ pub fn run_with_challenge(
         }
         .into(),
     });
-    let mut gateway = Gateway::connect_with_challenge(profile, password, challenge)?;
+    let mut gateway = Gateway::connect_with_callbacks(profile, password, challenge, |message| {
+        emit(Event::Status {
+            message: message.into(),
+        });
+    })?;
     let session_result: Result<()> = (|| {
         if cancel.load(Ordering::Relaxed) {
             return Ok(());

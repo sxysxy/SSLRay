@@ -1,5 +1,7 @@
 use crate::certificate_gate::{CertificateApproval, CertificateTarget};
 use crate::certificate_ui::{self, CertificateChoice};
+use crate::diagnostics::{self, DiagnosticKind};
+use crate::error_ui;
 use crate::i18n::{self, Language, Text as T, text};
 use crate::profiles::ProfileLibrary;
 use crate::runtime::{ConnectionState, Controller, Snapshot};
@@ -34,7 +36,6 @@ struct Palette {
     green: Color32,
     danger: Color32,
     warning: Color32,
-    warning_bg: Color32,
 }
 
 fn palette(ui: &egui::Ui) -> Palette {
@@ -54,7 +55,6 @@ fn theme_palette(dark: bool) -> Palette {
             green: Color32::from_rgb(61, 202, 152),
             danger: Color32::from_rgb(255, 140, 128),
             warning: Color32::from_rgb(241, 196, 103),
-            warning_bg: Color32::from_rgb(61, 46, 25),
         }
     } else {
         Palette {
@@ -68,7 +68,6 @@ fn theme_palette(dark: bool) -> Palette {
             green: Color32::from_rgb(15, 133, 89),
             danger: Color32::from_rgb(180, 54, 43),
             warning: Color32::from_rgb(139, 91, 18),
-            warning_bg: Color32::from_rgb(255, 246, 224),
         }
     }
 }
@@ -121,11 +120,14 @@ impl Notice {
     }
     fn display(&self, language: Language) -> String {
         match &self.detail {
-            Some(detail) => format!(
-                "{}: {}",
-                text(language, self.title),
-                i18n::diagnostic(language, detail)
-            ),
+            Some(detail) => {
+                let diagnostic = diagnostics::describe(language, detail);
+                if diagnostic.kind == DiagnosticKind::Unknown {
+                    text(language, self.title).into()
+                } else {
+                    format!("{}: {}", text(language, self.title), diagnostic.summary)
+                }
+            }
             None => text(language, self.title).into(),
         }
     }
@@ -255,6 +257,7 @@ struct App {
     use_otp: bool,
     show_password: bool,
     route_text: String,
+    selected_log: Option<(usize, String)>,
     page: Page,
     notice: Option<Notice>,
     tray: Option<tray::Tray>,
@@ -285,7 +288,7 @@ pub fn run() -> Result<()> {
             .with_inner_size([1060.0, 790.0])
             .with_min_inner_size([940.0, 650.0])
             .with_icon(egui::IconData {
-                rgba: tray::icon_rgba(64),
+                rgba: tray::icon_rgba(64)?,
                 width: 64,
                 height: 64,
             }),
@@ -322,7 +325,7 @@ impl App {
         let language = preferences.language;
         let theme = preferences.theme;
         configure(&cc.egui_ctx, theme);
-        let (profiles, profiles_writable) = match config_dir.as_ref() {
+        let (mut profiles, mut profiles_writable) = match config_dir.as_ref() {
             Some(directory) => match ProfileLibrary::load(directory) {
                 Ok(profiles) => (profiles, true),
                 Err(error) => {
@@ -332,13 +335,19 @@ impl App {
             },
             None => (ProfileLibrary::default(), false),
         };
-        let profile = profiles.selected().profile.clone();
-        let remember_password = profiles.selected().saved_password.is_some();
-        let password = profiles
-            .selected()
-            .saved_password
-            .clone()
-            .unwrap_or_default();
+        let (profile, remember_password, password) = match profiles.selected() {
+            Ok(selected) => (
+                selected.profile.clone(),
+                selected.saved_password.is_some(),
+                selected.saved_password.clone().unwrap_or_default(),
+            ),
+            Err(error) => {
+                notice = Some(Notice::error(T::ReadProfilesFailed, error));
+                profiles = ProfileLibrary::default();
+                profiles_writable = false;
+                (Profile::default(), false, String::new())
+            }
+        };
         let system_tray = match tray::Tray::new(cc.egui_ctx.clone(), language) {
             Ok(tray) => Some(tray),
             Err(error) => {
@@ -364,6 +373,7 @@ impl App {
             otp: String::new(),
             use_otp: false,
             show_password: false,
+            selected_log: None,
             page: Page::Overview,
             notice,
             tray: system_tray,
@@ -723,19 +733,24 @@ impl App {
     fn save(&mut self) -> Result<()> {
         self.apply_routes();
         let mut candidate = self.profiles.clone();
+        candidate.selected()?;
         candidate.update_selected(self.profile.clone())?;
         anyhow::ensure!(
             !self.remember_password || !self.password.is_empty(),
             "Enter the password to save"
         );
         candidate.set_saved_password(self.remember_password.then(|| self.password.clone()))?;
+        let saved_profile = candidate.selected()?.profile.clone();
         self.persist_library(&candidate)?;
-        self.profile = candidate.selected().profile.clone();
+        self.profile = saved_profile;
         self.profiles = candidate;
         Ok(())
     }
 
     fn dirty(&self) -> bool {
+        let Ok(selected) = self.profiles.selected() else {
+            return true;
+        };
         let mut draft = self.profile.clone();
         draft.use_server_routes = draft.route_mode != RouteMode::ManualOnly;
         draft.routes = self
@@ -746,10 +761,9 @@ impl App {
             .map(str::to_owned)
             .collect();
         !self.profiles.is_current_profile(&draft)
-            || self.remember_password != self.profiles.selected().saved_password.is_some()
+            || self.remember_password != selected.saved_password.is_some()
             || (self.remember_password
-                && self.profiles.selected().saved_password.as_deref()
-                    != Some(self.password.as_str()))
+                && selected.saved_password.as_deref() != Some(self.password.as_str()))
     }
 
     fn request_profile_action(&mut self, action: ProfileAction) {
@@ -781,7 +795,7 @@ impl App {
                     candidate.insert(profile)?;
                 }
                 ProfileAction::Duplicate => {
-                    let mut profile = candidate.selected().profile.clone();
+                    let mut profile = candidate.selected()?.profile.clone();
                     profile.name = candidate.unique_name(&format!(
                         "{} {}",
                         profile.name,
@@ -792,23 +806,26 @@ impl App {
                 }
                 ProfileAction::Delete => candidate.remove_selected()?,
             }
+            candidate.selected()?;
             self.persist_library(&candidate)?;
             Ok(candidate)
         })();
         match result {
             Ok(profiles) => {
+                let selected = match profiles.selected() {
+                    Ok(selected) => selected.clone(),
+                    Err(error) => {
+                        self.notice = Some(Notice::error(T::ProfileActionFailed, error));
+                        return;
+                    }
+                };
                 self.clear_certificate_check();
                 self.password.zeroize();
                 self.otp.zeroize();
                 self.profiles = profiles;
-                self.profile = self.profiles.selected().profile.clone();
-                self.password = self
-                    .profiles
-                    .selected()
-                    .saved_password
-                    .clone()
-                    .unwrap_or_default();
-                self.remember_password = self.profiles.selected().saved_password.is_some();
+                self.profile = selected.profile.clone();
+                self.password = selected.saved_password.clone().unwrap_or_default();
+                self.remember_password = selected.saved_password.is_some();
                 self.route_text = self.profile.routes.join("\n");
                 self.use_otp = false;
                 self.show_password = false;
@@ -835,18 +852,49 @@ impl App {
         let lang = self.language;
         let colors = palette(ui);
         let busy = self.busy();
+        let selected_name = match self.profiles.selected() {
+            Ok(selected) => selected.profile.name.clone(),
+            Err(error) => {
+                self.notice = Some(Notice::error(T::ReadProfilesFailed, error));
+                card(ui).show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.set_max_width(ui.available_width());
+                    bounded_label(ui, text(lang, T::ProfileStorageBlocked), colors.danger);
+                });
+                ui.add_space(16.0);
+                return;
+            }
+        };
         card(ui).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.set_max_width(ui.available_width());
             field_label(ui, text(lang, T::SelectProfile));
             let mut selected = self.profiles.selected_id;
             ui.horizontal(|ui| {
+                let action_width = if management {
+                    0.0
+                } else {
+                    ui.painter()
+                        .layout_no_wrap(
+                            text(lang, T::ManageProfiles).to_owned(),
+                            FontId::proportional(13.0),
+                            colors.ink,
+                        )
+                        .size()
+                        .x
+                        + ui.spacing().button_padding.x * 2.0
+                        + ui.spacing().item_spacing.x
+                };
+                let selector_width = (ui.available_width() - action_width).max(1.0);
                 ui.add_enabled_ui(!busy, |ui| {
                     egui::ComboBox::from_id_salt(if management {
                         "settings-profile"
                     } else {
                         "overview-profile"
                     })
-                    .width((ui.available_width() - 160.0).max(220.0))
-                    .selected_text(&self.profiles.selected().profile.name)
+                    .width(selector_width)
+                    .truncate()
+                    .selected_text(&selected_name)
                     .show_ui(ui, |ui| {
                         for entry in &self.profiles.entries {
                             ui.selectable_value(&mut selected, entry.id, &entry.profile.name);
@@ -914,6 +962,14 @@ impl App {
         if self.busy() || self.certificate_query.is_some() || self.certificate_review.is_some() {
             return;
         }
+        let has_saved_password = match self.profiles.selected() {
+            Ok(selected) => selected.saved_password.is_some(),
+            Err(error) => {
+                self.page = Page::Settings;
+                self.notice = Some(Notice::error(T::ReadProfilesFailed, error));
+                return;
+            }
+        };
         self.show_password = false;
         self.apply_routes();
         if self.profile.protocol != VpnProtocol::OpenVpn && self.profile.username.trim().is_empty()
@@ -956,7 +1012,7 @@ impl App {
             self.password_dialog = true;
             return;
         }
-        if (self.remember_password || self.profiles.selected().saved_password.is_some())
+        if (self.remember_password || has_saved_password)
             && let Err(error) = self.save()
         {
             self.notice = Some(Notice::error(T::SaveFailed, error));
@@ -1060,7 +1116,10 @@ impl App {
                 Err(text(self.language, T::CertificateCheckFailed).into())
             }
         };
-        let query = self.certificate_query.take().unwrap();
+        let Some(query) = self.certificate_query.take() else {
+            self.notice = Some(Notice::plain(T::CertificateCheckFailed));
+            return;
+        };
         match result {
             Ok(report) if report.verification_errors.is_empty() => {
                 self.certificate_approval = Some(CertificateApproval {
@@ -1128,7 +1187,10 @@ impl App {
                 &mut review.remember,
             );
             if let Some(choice) = choice {
-                let review = self.certificate_review.take().unwrap();
+                let Some(review) = self.certificate_review.take() else {
+                    self.notice = Some(Notice::plain(T::CertificateDecisionFailed));
+                    return;
+                };
                 if matches!(choice, CertificateChoice::Continue)
                     && review.target
                         == CertificateTarget::new(self.profiles.selected_id, &self.profile)
@@ -1368,14 +1430,21 @@ impl App {
                 ui.add_space(16.0);
                 ui.separator();
                 ui.add_space(10.0);
-                ui.label(
-                    RichText::new(i18n::diagnostic(lang, &message))
-                        .size(12.0)
-                        .color(colors.muted),
-                );
+                if matches!(self.controller.snapshot().state, ConnectionState::Failed) {
+                    error_ui::error(ui, lang, &message);
+                } else {
+                    bounded_label(ui, i18n::diagnostic(lang, &message).as_ref(), colors.muted);
+                }
             }
         });
         ui.add_space(17.0);
+        if connected
+            && self.controller.snapshot().transport.as_deref()
+                == Some("UDP/AES-128-CBC (legacy, unauthenticated)")
+        {
+            bounded_label(ui, text(lang, T::LegacyUdpWarning), colors.warning);
+            ui.add_space(10.0);
+        }
         let snapshot = self.controller.snapshot();
         let address = snapshot.address.as_deref().unwrap_or("—").to_owned();
         let interface = snapshot.interface.as_deref().unwrap_or("—").to_owned();
@@ -1674,17 +1743,23 @@ impl App {
                                     text(lang, transport_label(protocol, transport)),
                                 );
                             }
-                            ui.add_enabled_ui(protocol != VpnProtocol::Cisco, |ui| {
-                                ui.selectable_value(
-                                    &mut self.profile.transport,
-                                    TransportMode::Udp,
-                                    text(lang, transport_label(protocol, TransportMode::Udp)),
-                                );
-                            })
+                            ui.add_enabled_ui(
+                                protocol != VpnProtocol::Cisco
+                                    && self.profile.crypto != CryptoMode::GmTls13,
+                                |ui| {
+                                    ui.selectable_value(
+                                        &mut self.profile.transport,
+                                        TransportMode::Udp,
+                                        text(lang, transport_label(protocol, TransportMode::Udp)),
+                                    );
+                                },
+                            )
                             .response
                             .on_hover_text(text(
                                 lang,
-                                if protocol == VpnProtocol::Cisco {
+                                if self.profile.crypto == CryptoMode::GmTls13 {
+                                    T::GmTransportHelp
+                                } else if protocol == VpnProtocol::Cisco {
                                     T::CiscoTransportHelp
                                 } else if protocol == VpnProtocol::Huawei {
                                     T::UdpTooltip
@@ -1730,27 +1805,14 @@ impl App {
                             ));
                         });
                 });
+                if self.profile.crypto == CryptoMode::GmTls13
+                    && self.profile.transport == TransportMode::Udp
+                {
+                    self.profile.transport = TransportMode::Auto;
+                }
                 if protocol == VpnProtocol::Huawei {
                     ui.add_space(12.0);
-                    ui.checkbox(
-                        &mut self.profile.allow_legacy_udp,
-                        text(lang, T::AllowLegacyUdp),
-                    )
-                    .on_hover_text(text(lang, T::LegacyUdpTooltip));
-                    if self.profile.allow_legacy_udp {
-                        ui.add_space(7.0);
-                        egui::Frame::new()
-                            .fill(colors.warning_bg)
-                            .corner_radius(7)
-                            .inner_margin(10.0)
-                            .show(ui, |ui| {
-                                ui.label(
-                                    RichText::new(text(lang, T::LegacyUdpWarning))
-                                        .size(12.0)
-                                        .color(colors.warning),
-                                );
-                            });
-                    }
+                    bounded_label(ui, text(lang, T::LegacyUdpAutoHelp), colors.muted);
                 }
                 ui.add_space(10.0);
                 ui.label(
@@ -1828,151 +1890,16 @@ impl App {
                         .margin(Vec2::splat(9.0)),
                 );
             });
-            ui.add_space(16.0);
-            card(ui).show(ui, |ui| {
-                action_row(ui, |ui| {
-                    ui.label(RichText::new(text(lang, T::Routing)).size(14.0).strong());
-                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                        ui.label("MTU");
-                        ui.add(egui::DragValue::new(&mut self.profile.mtu).range(576..=1500));
-                    });
-                });
-                ui.add_space(9.0);
-                field_label(ui, text(lang, T::RoutePolicy));
-                egui::ComboBox::from_id_salt("route-policy")
-                    .width(ui.available_width())
-                    .selected_text(text(lang, route_policy_label(self.profile.route_mode)))
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut self.profile.route_mode,
-                            RouteMode::GatewayOnly,
-                            text(lang, T::RouteGatewayOnly),
-                        );
-                        ui.selectable_value(
-                            &mut self.profile.route_mode,
-                            RouteMode::Merge,
-                            text(lang, T::RouteMerge),
-                        );
-                        ui.selectable_value(
-                            &mut self.profile.route_mode,
-                            RouteMode::ManualOnly,
-                            text(lang, T::RouteManual),
-                        );
-                        ui.selectable_value(
-                            &mut self.profile.route_mode,
-                            RouteMode::FullTunnel,
-                            text(lang, T::RouteFull),
-                        );
-                    });
-                ui.add_space(9.0);
-                if self.profile.route_mode == RouteMode::GatewayOnly {
-                    ui.label(
-                        RichText::new(text(lang, T::GatewayRoutesHelp))
-                            .size(12.0)
-                            .color(colors.muted),
-                    );
-                } else if self.profile.route_mode == RouteMode::FullTunnel {
-                    ui.label(
-                        RichText::new(text(lang, T::FullTunnelHelp))
-                            .size(12.0)
-                            .color(colors.muted),
-                    );
-                } else {
-                    ui.label(
-                        RichText::new(text(lang, T::RouteSafetyHelp))
-                            .size(12.0)
-                            .color(colors.muted),
-                    );
-                }
-                ui.add_space(12.0);
-                field_label(ui, text(lang, T::ManualRoutes));
-                ui.label(
-                    RichText::new(text(lang, T::ManualRoutesHelp))
-                        .size(12.0)
-                        .color(colors.muted),
-                );
-                if self.profile.route_mode == RouteMode::ManualOnly
-                    && self.route_text.trim().is_empty()
-                {
-                    ui.label(
-                        RichText::new(text(lang, T::NoManualRoutes))
-                            .size(12.0)
-                            .color(colors.warning),
-                    );
-                }
-                ui.add_space(8.0);
-                let manual_active = matches!(
-                    self.profile.route_mode,
-                    RouteMode::Merge | RouteMode::ManualOnly
-                );
-                if !manual_active {
-                    ui.label(
-                        RichText::new(text(lang, T::ManualRoutesInactive))
-                            .size(12.0)
-                            .color(colors.muted),
-                    );
-                }
-                ui.add_enabled(
-                    manual_active,
-                    egui::TextEdit::multiline(&mut self.route_text)
-                        .font(egui::TextStyle::Monospace)
-                        .desired_width(f32::INFINITY)
-                        .desired_rows(3)
-                        .margin(Vec2::splat(9.0)),
-                );
-            });
         });
         ui.add_space(16.0);
-        card(ui).show(ui, |ui| {
-            let snapshot = self.controller.snapshot();
-            let connected = snapshot.state == ConnectionState::Connected;
-            for (title, routes, empty) in [
-                (
-                    T::AdvertisedRoutes,
-                    &snapshot.advertised_routes,
-                    T::NoAdvertisedRoutes,
-                ),
-                (
-                    T::AppliedRoutes,
-                    &snapshot.applied_routes,
-                    T::NoAppliedRoutes,
-                ),
-            ] {
-                ui.label(
-                    RichText::new(format!("{} ({})", text(lang, title), routes.len()))
-                        .size(13.0)
-                        .strong(),
-                );
-                ui.add_space(5.0);
-                if routes.is_empty() {
-                    ui.label(
-                        RichText::new(text(
-                            lang,
-                            if connected {
-                                empty
-                            } else {
-                                T::RoutesAfterConnect
-                            },
-                        ))
-                        .size(12.0)
-                        .color(colors.muted),
-                    );
-                } else {
-                    egui::ScrollArea::vertical()
-                        .id_salt(format!("routes-{title:?}"))
-                        .max_height(115.0)
-                        .show(ui, |ui| {
-                            for route in routes {
-                                ui.add(
-                                    egui::Label::new(RichText::new(route).monospace())
-                                        .selectable(true),
-                                );
-                            }
-                        });
-                }
-                ui.add_space(12.0);
-            }
-        });
+        render_route_panels(
+            ui,
+            lang,
+            &mut self.profile,
+            &mut self.route_text,
+            !busy,
+            self.controller.snapshot(),
+        );
         if busy {
             ui.add_space(10.0);
             ui.label(RichText::new(text(lang, T::DisconnectToEdit)).color(colors.muted));
@@ -2038,36 +1965,12 @@ impl App {
                 .color(colors.muted),
         );
         ui.add_space(14.0);
-        card(ui).show(ui, |ui| {
-            ui.set_min_height(410.0);
-            let logs = &self.controller.snapshot().logs;
-            if logs.is_empty() {
-                ui.add_space(135.0);
-                ui.vertical_centered(|ui| {
-                    ui.label(
-                        RichText::new(text(lang, T::NoEvents))
-                            .size(17.0)
-                            .color(colors.muted),
-                    );
-                    ui.add_space(8.0);
-                    ui.label(RichText::new(text(lang, T::EventsAfterConnect)).color(colors.muted));
-                });
-            } else {
-                egui::ScrollArea::vertical()
-                    .stick_to_bottom(true)
-                    .max_height(500.0)
-                    .show(ui, |ui| {
-                        for line in logs {
-                            ui.label(
-                                RichText::new(i18n::diagnostic(lang, line))
-                                    .font(FontId::monospace(11.0))
-                                    .color(colors.ink),
-                            );
-                            ui.add_space(5.0);
-                        }
-                    });
-            }
-        });
+        render_log_view(
+            ui,
+            lang,
+            &self.controller.snapshot().logs,
+            &mut self.selected_log,
+        );
     }
 
     fn refresh_adapter(&mut self, ctx: &egui::Context) {
@@ -2251,27 +2154,7 @@ impl App {
             ui.label(text(lang, T::AuthorizationRetryHelp));
         });
         ui.add_space(16.0);
-        card(ui).show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
-            ui.label(RichText::new(text(lang, T::About)).size(16.0).strong());
-            ui.add_space(10.0);
-            ui.label(format!(
-                "{}: {}",
-                text(lang, T::Version),
-                env!("CARGO_PKG_VERSION")
-            ));
-            ui.label(format!(
-                "{}: {} / {}",
-                text(lang, T::Platform),
-                std::env::consts::OS,
-                std::env::consts::ARCH
-            ));
-            ui.label(format!(
-                "{}: {}",
-                text(lang, T::CryptoBackend),
-                self.crypto_backend
-            ));
-        });
+        render_about_card(ui, lang, &self.crypto_backend);
     }
 }
 
@@ -2306,25 +2189,36 @@ impl eframe::App for App {
             self.otp.zeroize();
             self.remember_password = false;
             let mut candidate = self.profiles.clone();
-            let had_saved_password = candidate.selected().saved_password.is_some();
-            let result = candidate.set_saved_password(None).and_then(|()| {
-                if had_saved_password {
-                    self.persist_library(&candidate)
-                } else {
-                    Ok(())
+            match candidate
+                .selected()
+                .map(|selected| selected.saved_password.is_some())
+            {
+                Err(error) => {
+                    self.notice = Some(Notice::error(T::ReadProfilesFailed, error));
+                    self.password_dialog = false;
+                    self.page = Page::Settings;
                 }
-            });
-            self.profiles = candidate;
-            self.notice = Some(match result {
-                Ok(()) if had_saved_password => Notice {
-                    title: T::PasswordRejected,
-                    detail: Some(text(self.language, T::SavedPasswordRemoved).into()),
-                },
-                Ok(()) => Notice::plain(T::PasswordRejected),
-                Err(error) => Notice::error(T::SaveFailed, error),
-            });
-            self.password_dialog = true;
-            self.show(ctx);
+                Ok(had_saved_password) => {
+                    let result = candidate.set_saved_password(None).and_then(|()| {
+                        if had_saved_password {
+                            self.persist_library(&candidate)
+                        } else {
+                            Ok(())
+                        }
+                    });
+                    self.profiles = candidate;
+                    self.notice = Some(match result {
+                        Ok(()) if had_saved_password => Notice {
+                            title: T::PasswordRejected,
+                            detail: Some(text(self.language, T::SavedPasswordRemoved).into()),
+                        },
+                        Ok(()) => Notice::plain(T::PasswordRejected),
+                        Err(error) => Notice::error(T::SaveFailed, error),
+                    });
+                    self.password_dialog = true;
+                    self.show(ctx);
+                }
+            }
         }
         if self.controller.snapshot().state == ConnectionState::AwaitingOtp {
             if !self.challenge_prompted {
@@ -2418,19 +2312,14 @@ impl eframe::App for App {
                     });
                 });
                 ui.add_space(23.0);
-                if let Some(notice) = self.notice.as_ref().map(|notice| notice.display(lang)) {
-                    egui::Frame::new()
-                        .fill(colors.pale)
-                        .corner_radius(8)
-                        .inner_margin(11.0)
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(RichText::new(notice).size(12.0).color(colors.ink));
-                                if ui.small_button("×").clicked() {
-                                    self.notice = None;
-                                }
-                            });
-                        });
+                if let Some((title, detail)) = self
+                    .notice
+                    .as_ref()
+                    .map(|notice| (text(lang, notice.title), notice.detail.clone()))
+                {
+                    if error_ui::notice(ui, lang, title, detail.as_deref()) {
+                        self.notice = None;
+                    }
                     ui.add_space(14.0);
                 }
                 egui::ScrollArea::vertical()
@@ -2682,6 +2571,432 @@ fn apply_theme(ctx: &egui::Context, theme: Theme) {
     }));
 }
 
+/// Route editing and session facts have independent enabled states.
+fn render_route_panels(
+    ui: &mut egui::Ui,
+    language: Language,
+    profile: &mut Profile,
+    route_text: &mut String,
+    editable: bool,
+    snapshot: &Snapshot,
+) {
+    let width = ui.available_width();
+    let gap = 16.0;
+    if width >= 640.0 {
+        let usable = width - gap;
+        let left = (usable * 0.44).max(280.0);
+        let right = usable - left;
+        ui.allocate_ui_with_layout(
+            Vec2::new(width, 0.0),
+            egui::Layout::left_to_right(Align::Min),
+            |ui| {
+                ui.spacing_mut().item_spacing.x = gap;
+                ui.allocate_ui_with_layout(
+                    Vec2::new(left, 0.0),
+                    egui::Layout::top_down(Align::Min),
+                    |ui| {
+                        ui.set_width(left);
+                        ui.set_max_width(left);
+                        route_settings_card(ui, language, profile, route_text, editable);
+                    },
+                );
+                ui.allocate_ui_with_layout(
+                    Vec2::new(right, 0.0),
+                    egui::Layout::top_down(Align::Min),
+                    |ui| {
+                        ui.set_width(right);
+                        ui.set_max_width(right);
+                        route_information_card(ui, language, snapshot);
+                    },
+                );
+            },
+        );
+    } else {
+        route_settings_card(ui, language, profile, route_text, editable);
+        ui.add_space(gap);
+        route_information_card(ui, language, snapshot);
+    }
+}
+
+fn route_settings_card(
+    ui: &mut egui::Ui,
+    language: Language,
+    profile: &mut Profile,
+    route_text: &mut String,
+    editable: bool,
+) {
+    let lang = language;
+    let colors = palette(ui);
+    ui.add_enabled_ui(editable, |ui| {
+        card(ui).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.set_max_width(ui.available_width());
+            action_row(ui, |ui| {
+                ui.label(RichText::new(text(lang, T::Routing)).size(14.0).strong());
+                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                    ui.label("MTU");
+                    ui.add(egui::DragValue::new(&mut profile.mtu).range(576..=1500));
+                });
+            });
+            ui.add_space(9.0);
+            field_label(ui, text(lang, T::RoutePolicy));
+            egui::ComboBox::from_id_salt("route-policy")
+                .width(ui.available_width())
+                .wrap()
+                .selected_text(text(lang, route_policy_label(profile.route_mode)))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut profile.route_mode,
+                        RouteMode::GatewayOnly,
+                        text(lang, T::RouteGatewayOnly),
+                    );
+                    ui.selectable_value(
+                        &mut profile.route_mode,
+                        RouteMode::Merge,
+                        text(lang, T::RouteMerge),
+                    );
+                    ui.selectable_value(
+                        &mut profile.route_mode,
+                        RouteMode::ManualOnly,
+                        text(lang, T::RouteManual),
+                    );
+                    ui.selectable_value(
+                        &mut profile.route_mode,
+                        RouteMode::FullTunnel,
+                        text(lang, T::RouteFull),
+                    );
+                });
+            ui.add_space(9.0);
+            if profile.route_mode == RouteMode::GatewayOnly {
+                ui.label(
+                    RichText::new(text(lang, T::GatewayRoutesHelp))
+                        .size(12.0)
+                        .color(colors.muted),
+                );
+            } else if profile.route_mode == RouteMode::FullTunnel {
+                ui.label(
+                    RichText::new(text(lang, T::FullTunnelHelp))
+                        .size(12.0)
+                        .color(colors.muted),
+                );
+            } else {
+                ui.label(
+                    RichText::new(text(lang, T::RouteSafetyHelp))
+                        .size(12.0)
+                        .color(colors.muted),
+                );
+            }
+            ui.add_space(12.0);
+            field_label(ui, text(lang, T::ManualRoutes));
+            ui.label(
+                RichText::new(text(lang, T::ManualRoutesHelp))
+                    .size(12.0)
+                    .color(colors.muted),
+            );
+            if profile.route_mode == RouteMode::ManualOnly && route_text.trim().is_empty() {
+                ui.label(
+                    RichText::new(text(lang, T::NoManualRoutes))
+                        .size(12.0)
+                        .color(colors.warning),
+                );
+            }
+            ui.add_space(8.0);
+            let manual_active =
+                matches!(profile.route_mode, RouteMode::Merge | RouteMode::ManualOnly);
+            if !manual_active {
+                ui.label(
+                    RichText::new(text(lang, T::ManualRoutesInactive))
+                        .size(12.0)
+                        .color(colors.muted),
+                );
+            }
+            ui.add_enabled(
+                manual_active,
+                egui::TextEdit::multiline(route_text)
+                    .font(egui::TextStyle::Monospace)
+                    .desired_width(f32::INFINITY)
+                    .desired_rows(3)
+                    .margin(Vec2::splat(9.0)),
+            );
+        });
+    });
+}
+
+fn route_information_card(ui: &mut egui::Ui, language: Language, snapshot: &Snapshot) {
+    let lang = language;
+    let colors = palette(ui);
+    card(ui).show(ui, |ui| {
+        ui.set_min_width(ui.available_width());
+        ui.set_max_width(ui.available_width());
+        let connected = snapshot.state == ConnectionState::Connected;
+        for (title, routes, empty) in [
+            (
+                T::AdvertisedRoutes,
+                &snapshot.advertised_routes,
+                T::NoAdvertisedRoutes,
+            ),
+            (
+                T::AppliedRoutes,
+                &snapshot.applied_routes,
+                T::NoAppliedRoutes,
+            ),
+        ] {
+            ui.label(
+                RichText::new(format!("{} ({})", text(lang, title), routes.len()))
+                    .size(13.0)
+                    .strong(),
+            );
+            ui.add_space(5.0);
+            if routes.is_empty() {
+                ui.label(
+                    RichText::new(text(
+                        lang,
+                        if connected {
+                            empty
+                        } else {
+                            T::RoutesAfterConnect
+                        },
+                    ))
+                    .size(12.0)
+                    .color(colors.muted),
+                );
+            } else {
+                egui::ScrollArea::vertical()
+                    .id_salt(format!("routes-{title:?}"))
+                    .max_height(200.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        for route in routes {
+                            ui.add(
+                                egui::Label::new(RichText::new(route).monospace()).selectable(true),
+                            );
+                        }
+                    });
+            }
+            ui.add_space(12.0);
+        }
+    });
+}
+
+/// Render only the supplied session log; no controller, configuration or I/O.
+fn render_log_view(
+    ui: &mut egui::Ui,
+    language: Language,
+    logs: &[String],
+    selected_log: &mut Option<(usize, String)>,
+) {
+    let colors = palette(ui);
+    if logs.is_empty() {
+        *selected_log = None;
+        card(ui).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.label(
+                RichText::new(text(language, T::NoEvents))
+                    .size(16.0)
+                    .strong(),
+            );
+            ui.add_space(8.0);
+            bounded_label(ui, text(language, T::EventsAfterConnect), colors.muted);
+        });
+        return;
+    }
+
+    // The runtime retains at most 200 lines. Preserve the selected event when
+    // that ring buffer shifts; a reset or removed event cannot leave a bad index.
+    let selected = selected_log
+        .as_ref()
+        .and_then(|(index, raw)| {
+            if logs.get(*index).is_some_and(|line| line == raw) {
+                Some(*index)
+            } else {
+                logs.iter().rposition(|line| line == raw)
+            }
+        })
+        .or_else(|| logs.len().checked_sub(1));
+    *selected_log = selected.and_then(|index| logs.get(index).map(|raw| (index, raw.clone())));
+
+    let width = ui.available_width();
+    let gap = 16.0;
+    let list_height =
+        (ui.clip_rect().bottom() - ui.next_widget_position().y - 80.0).clamp(80.0, 560.0);
+    if width >= 640.0 {
+        let usable = width - gap;
+        let left = (usable * 0.44).max(280.0);
+        let right = usable - left;
+        ui.allocate_ui_with_layout(
+            Vec2::new(width, 0.0),
+            egui::Layout::left_to_right(Align::Min),
+            |ui| {
+                ui.spacing_mut().item_spacing.x = gap;
+                ui.allocate_ui_with_layout(
+                    Vec2::new(left, 0.0),
+                    egui::Layout::top_down(Align::Min),
+                    |ui| {
+                        ui.set_width(left);
+                        ui.set_max_width(left);
+                        if let Some(index) =
+                            log_list_card(ui, language, logs, selected, list_height)
+                            && let Some(raw) = logs.get(index)
+                        {
+                            *selected_log = Some((index, raw.clone()));
+                        }
+                    },
+                );
+                ui.allocate_ui_with_layout(
+                    Vec2::new(right, 0.0),
+                    egui::Layout::top_down(Align::Min),
+                    |ui| {
+                        ui.set_width(right);
+                        ui.set_max_width(right);
+                        log_detail_card(
+                            ui,
+                            language,
+                            logs,
+                            selected_log.as_ref().map(|(index, _)| *index),
+                        );
+                    },
+                );
+            },
+        );
+    } else {
+        if let Some(index) = log_list_card(ui, language, logs, selected, list_height.min(260.0))
+            && let Some(raw) = logs.get(index)
+        {
+            *selected_log = Some((index, raw.clone()));
+        }
+        ui.add_space(gap);
+        log_detail_card(
+            ui,
+            language,
+            logs,
+            selected_log.as_ref().map(|(index, _)| *index),
+        );
+    }
+}
+
+fn log_list_card(
+    ui: &mut egui::Ui,
+    language: Language,
+    logs: &[String],
+    selected: Option<usize>,
+    max_height: f32,
+) -> Option<usize> {
+    let colors = palette(ui);
+    let mut clicked = None;
+    card(ui).show(ui, |ui| {
+        ui.set_min_width(ui.available_width());
+        ui.set_max_width(ui.available_width());
+        ui.label(
+            RichText::new(format!("{} ({})", text(language, T::LogList), logs.len())).strong(),
+        );
+        ui.add_space(10.0);
+        egui::ScrollArea::vertical()
+            .id_salt("session-log-list")
+            .stick_to_bottom(true)
+            .max_height(max_height)
+            .min_scrolled_height(0.0)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                ui.set_max_width(ui.available_width());
+                for (index, raw) in logs.iter().enumerate() {
+                    let summary = log_summary(language, raw);
+                    let width = ui.available_width();
+                    let mut layout = egui::text::LayoutJob::simple(
+                        format!("{:03}  {summary}", index + 1),
+                        FontId::proportional(12.0),
+                        colors.ink,
+                        (width - ui.spacing().button_padding.x * 2.0).max(1.0),
+                    );
+                    // The full summary is in the selected-event panel and
+                    // tooltip. Only this compact list preview has two rows.
+                    layout.wrap.max_rows = 2;
+                    layout.wrap.break_anywhere = true;
+                    if ui
+                        .add(
+                            egui::Button::new(layout)
+                                .wrap()
+                                .selected(selected == Some(index))
+                                .min_size(Vec2::new(width, 0.0)),
+                        )
+                        .on_hover_text(&summary)
+                        .clicked()
+                    {
+                        clicked = Some(index);
+                    }
+                }
+            });
+    });
+    clicked
+}
+
+fn log_detail_card(
+    ui: &mut egui::Ui,
+    language: Language,
+    logs: &[String],
+    selected: Option<usize>,
+) {
+    let colors = palette(ui);
+    card(ui).show(ui, |ui| {
+        ui.set_min_width(ui.available_width());
+        ui.set_max_width(ui.available_width());
+        ui.label(RichText::new(text(language, T::LogDetail)).strong());
+        ui.add_space(10.0);
+        if let Some((index, raw)) =
+            selected.and_then(|index| logs.get(index).map(|raw| (index, raw)))
+        {
+            badge(ui, &format!("#{:03}", index + 1));
+            ui.add_space(8.0);
+            bounded_label(ui, &log_summary(language, raw), colors.ink);
+            ui.add_space(8.0);
+            ui.push_id(("selected-log-detail", index, raw), |ui| {
+                error_ui::technical_detail(ui, language, raw);
+            });
+        } else {
+            bounded_label(ui, text(language, T::SelectLog), colors.muted);
+        }
+    });
+}
+
+fn log_summary(language: Language, raw: &str) -> String {
+    let diagnostic = diagnostics::describe(language, raw);
+    if diagnostic.kind != DiagnosticKind::Unknown {
+        diagnostic.summary.to_owned()
+    } else {
+        i18n::known_diagnostic(language, raw).map_or_else(
+            || text(language, T::LogDiagnosticEvent).to_owned(),
+            |localized| localized.into_owned(),
+        )
+    }
+}
+
+fn render_about_card(ui: &mut egui::Ui, language: Language, crypto_backend: &str) {
+    card(ui).show(ui, |ui| {
+        ui.set_min_width(ui.available_width());
+        ui.set_max_width(ui.available_width());
+        ui.label(RichText::new(text(language, T::About)).size(16.0).strong());
+        ui.add_space(10.0);
+        ui.label(format!(
+            "{}: {}",
+            text(language, T::Version),
+            env!("CARGO_PKG_VERSION")
+        ));
+        ui.label(format!(
+            "{}: {} / {}",
+            text(language, T::Platform),
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+        ));
+        let colors = palette(ui);
+        bounded_label(
+            ui,
+            &format!("{}: {crypto_backend}", text(language, T::CryptoBackend)),
+            colors.ink,
+        );
+        ui.add_space(8.0);
+        ui.hyperlink_to("GitHub · sxysxy/SSLRay", "https://github.com/sxysxy/SSLRay");
+    });
+}
+
 fn action_row<R>(
     ui: &mut egui::Ui,
     contents: impl FnOnce(&mut egui::Ui) -> R,
@@ -2706,6 +3021,22 @@ fn card(ui: &egui::Ui) -> egui::Frame {
         .corner_radius(13)
         .inner_margin(20.0)
 }
+/// Keep full diagnostics copyable without allowing an unbroken line to widen
+/// its containing card. Call inside a region with the intended available width.
+fn bounded_label(ui: &mut egui::Ui, content: &str, color: Color32) -> egui::Response {
+    let width = ui.available_width().max(1.0);
+    ui.set_max_width(width);
+    let mut layout =
+        egui::text::LayoutJob::simple(content.to_owned(), FontId::proportional(12.0), color, width);
+    layout.wrap.break_anywhere = true;
+    ui.add(
+        egui::Label::new(layout)
+            .wrap()
+            .halign(Align::Min)
+            .selectable(true),
+    )
+}
+
 fn field_label(ui: &mut egui::Ui, text: &str) {
     let colors = palette(ui);
     ui.label(RichText::new(text).size(12.0).color(colors.muted));
@@ -2859,7 +3190,7 @@ mod tests {
             let profiles = ProfileLibrary::default();
             Self(App {
                 controller: Controller::new(),
-                profile: profiles.selected().profile.clone(),
+                profile: profiles.selected().unwrap().profile.clone(),
                 profiles,
                 profile_dialog: None,
                 profiles_writable: true,
@@ -2872,6 +3203,7 @@ mod tests {
                 use_otp: false,
                 show_password: false,
                 route_text: String::new(),
+                selected_log: None,
                 page: Page::Overview,
                 notice: None,
                 tray: None,
@@ -2900,6 +3232,33 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(self.0.config_dir.as_ref().unwrap());
         }
+    }
+
+    #[test]
+    fn missing_profile_selection_blocks_connection_saving_and_duplicate() {
+        let mut fixture = TestApp::new();
+        let app = &mut fixture.0;
+        app.profile.username = "synthetic-test-user".into();
+        app.password = "synthetic-test-password".into();
+        app.profiles.selected_id = u64::MAX;
+        assert!(app.dirty());
+
+        app.connect();
+        assert!(!app.busy());
+        assert!(app.certificate_query.is_none());
+        assert!(app.certificate_review.is_none());
+        assert!(!app.password_dialog);
+        assert!(matches!(app.page, Page::Settings));
+        assert_eq!(app.notice.as_ref().unwrap().title, T::ReadProfilesFailed);
+        assert!(app.save().is_err());
+        assert!(!app.config_dir.as_ref().unwrap().exists());
+
+        let profiles_before = app.profiles.entries.len();
+        app.perform_profile_action(ProfileAction::Duplicate);
+        assert_eq!(app.profiles.selected_id, u64::MAX);
+        assert_eq!(app.profiles.entries.len(), profiles_before);
+        assert_eq!(app.notice.as_ref().unwrap().title, T::ProfileActionFailed);
+        assert!(!app.config_dir.as_ref().unwrap().exists());
     }
 
     #[test]
@@ -3089,6 +3448,7 @@ mod tests {
         assert!(
             app.profiles
                 .selected()
+                .unwrap()
                 .profile
                 .certificate_sha256
                 .is_empty()
@@ -3130,14 +3490,14 @@ mod tests {
         let loaded = ProfileLibrary::load(app.config_dir.as_ref().unwrap()).unwrap();
         assert_eq!(loaded.selected_id, app.profiles.selected_id);
         assert_eq!(
-            loaded.selected().profile.certificate_sha256,
+            loaded.selected().unwrap().profile.certificate_sha256,
             review.report.certificate_sha256
         );
         assert_eq!(
             app.profile.certificate_sha256,
             review.report.certificate_sha256
         );
-        assert!(loaded.selected().saved_password.is_none());
+        assert!(loaded.selected().unwrap().saved_password.is_none());
         let stored =
             std::fs::read_to_string(app.config_dir.as_ref().unwrap().join("profiles.json"))
                 .unwrap();
@@ -3169,6 +3529,7 @@ mod tests {
         assert!(
             app.profiles
                 .selected()
+                .unwrap()
                 .profile
                 .certificate_sha256
                 .is_empty()
@@ -3189,7 +3550,7 @@ mod tests {
         app.remember_password = false;
         app.save().unwrap();
         let loaded = ProfileLibrary::load(app.config_dir.as_ref().unwrap()).unwrap();
-        assert!(loaded.selected().saved_password.is_none());
+        assert!(loaded.selected().unwrap().saved_password.is_none());
         app.theme = Theme::Dark;
         app.language = Language::En;
         app.save_preferences().unwrap();

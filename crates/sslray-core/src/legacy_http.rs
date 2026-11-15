@@ -159,8 +159,10 @@ fn form_escape(value: &str) -> Zeroizing<String> {
         if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
             result.push(b as char);
         } else {
-            use std::fmt::Write;
-            write!(&mut *result, "%{b:02X}").unwrap();
+            const HEX: &[u8; 16] = b"0123456789ABCDEF";
+            result.push('%');
+            result.push(HEX[(b >> 4) as usize] as char);
+            result.push(HEX[(b & 0x0f) as usize] as char);
         }
     }
     result

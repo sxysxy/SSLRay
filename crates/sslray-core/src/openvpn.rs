@@ -228,7 +228,9 @@ fn load_profile(profile: &Profile) -> Result<Prepared> {
         let trim = line.trim();
         if let Some((tag, content)) = &mut block {
             if trim == format!("</{tag}>") {
-                let (tag, content) = block.take().expect("active block");
+                let (tag, content) = block
+                    .take()
+                    .context("OpenVPN inline block state is missing")?;
                 ensure!(
                     blocks.insert(tag, content).is_none(),
                     "Duplicate OpenVPN inline certificate or key"

@@ -257,7 +257,9 @@ impl<'a> HttpClient<'a> {
             );
             self.stream = Some(s);
         }
-        Ok(self.stream.as_mut().unwrap())
+        self.stream
+            .as_mut()
+            .context("Cisco TLS channel unavailable")
     }
     fn cookie_header(&self) -> Zeroizing<String> {
         let mut s = Zeroizing::new(String::new());
@@ -554,7 +556,13 @@ fn authenticate(
                         );
                         round_otp = Some(otp);
                     }
-                    Zeroizing::new(round_otp.as_ref().unwrap().as_str().to_owned())
+                    Zeroizing::new(
+                        round_otp
+                            .as_ref()
+                            .context("Cisco verification input missing")?
+                            .as_str()
+                            .to_owned(),
+                    )
                 } else {
                     ensure!(
                         !password_sent,

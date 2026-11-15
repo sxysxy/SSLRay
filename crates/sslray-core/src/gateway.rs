@@ -356,10 +356,25 @@ impl Gateway {
     pub fn connect_with_challenge<F>(
         profile: &Profile,
         password: &str,
-        mut request_otp: F,
+        request_otp: F,
     ) -> Result<Self>
     where
         F: FnMut(&str) -> Result<Zeroizing<String>>,
+    {
+        Self::connect_with_callbacks(profile, password, request_otp, |_| {})
+    }
+
+    /// Reports per-connection transport negotiation without changing the profile.
+    /// Status strings contain no credentials, cookies or session identifiers.
+    pub fn connect_with_callbacks<F, S>(
+        profile: &Profile,
+        password: &str,
+        mut request_otp: F,
+        mut status: S,
+    ) -> Result<Self>
+    where
+        F: FnMut(&str) -> Result<Zeroizing<String>>,
+        S: FnMut(&str),
     {
         profile.validate()?;
         if profile.protocol == VpnProtocol::Cisco {
@@ -368,10 +383,6 @@ impl Gateway {
         if profile.protocol == VpnProtocol::OpenVpn {
             return Self::from_backend(crate::openvpn::connect(profile, password, request_otp)?);
         }
-        ensure!(
-            profile.crypto != CryptoMode::GmTls13 || profile.transport != TransportMode::Udp,
-            "Strict GM TLS mode cannot use the gateway's AES-256-GCM UDP data mode; select TLS or Auto"
-        );
         ensure!(
             !profile.username.is_empty() && !profile.username.contains('\0'),
             "Enter a valid username"
@@ -394,10 +405,7 @@ impl Gateway {
         if let FirstReply::Legacy(metadata) =
             receive_first(&mut control).context("Receiving Huawei FirstConnect")?
         {
-            ensure!(
-                profile.transport != TransportMode::Udp || profile.allow_legacy_udp,
-                "This gateway's legacy UDP uses AES-128-CBC without packet authentication. Explicitly enable legacy UDP compatibility or select TLS."
-            );
+            status("Huawei legacy protocol detected");
             ensure!(
                 metadata[..4] == [0; 4],
                 "Legacy gateway requires an unsupported certificate authentication method"
@@ -433,7 +441,7 @@ impl Gateway {
                 password,
                 request_otp,
             )?;
-            return legacy::connect(profile, authentication, auth);
+            return legacy::connect(profile, authentication, auth, &mut status);
         }
         let mut control_decoder = Decoder::default();
         let mut auth = Zeroizing::new(vec![0u8; 260]);

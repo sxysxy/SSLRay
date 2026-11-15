@@ -1,4 +1,4 @@
-//! Explicitly opted-in legacy CHIV UDP compatibility.
+//! Automatically negotiated legacy CHIV UDP compatibility.
 //! AES-128-CBC has no packet authentication in this vendor format. Connected
 //! source filtering and recent-IV rejection do not provide cryptographic integrity.
 use super::MAGIC;
@@ -193,7 +193,7 @@ impl LegacyUdp {
     pub fn probe(&mut self) -> Result<()> {
         let peer = match self.socket.peer_addr()?.ip() {
             std::net::IpAddr::V4(ip) => ip,
-            _ => unreachable!(),
+            _ => anyhow::bail!("Legacy UDP requires an IPv4 gateway"),
         };
         let packet = probe_packet(self.vip, peer);
         let bytes = self.encode(&packet)?;

@@ -3,7 +3,7 @@
 //! is provided separately by legacy_native; credentials never enter this module.
 use super::{DataChannel, Decoder, FRAME_TIMEOUT, Gateway, valid_ipv4};
 use crate::{
-    config::{Profile, TransportMode},
+    config::{CryptoMode, Profile, TransportMode},
     crypto,
     legacy_http::LegacyAuth,
 };
@@ -23,6 +23,27 @@ struct Frame {
     command: u16,
     payload: Zeroizing<Vec<u8>>,
 }
+#[derive(Debug)]
+struct HandshakeTimeout(String);
+impl std::fmt::Display for HandshakeTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Legacy gateway handshake timed out ({})", self.0)
+    }
+}
+impl std::error::Error for HandshakeTimeout {}
+
+#[derive(Debug)]
+struct UdpUnavailable(&'static str);
+impl std::fmt::Display for UdpUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+impl std::error::Error for UdpUnavailable {}
+
+const PENDING_UDP_KEY: u8 = 1;
+const PENDING_UDP_PORT: u8 = 2;
+const PENDING_TLS_SWITCH: u8 = 4;
 #[derive(Default)]
 struct LegacyDecoder {
     buffered: Vec<u8>,
@@ -162,12 +183,9 @@ fn receive(
     command: u16,
 ) -> Result<Frame> {
     for _ in 0..8 {
-        let reply = decoder.read(stream)?.with_context(|| {
-            format!(
-                "Legacy gateway handshake timed out ({})",
-                decoder.pending_summary()
-            )
-        })?;
+        let reply = decoder
+            .read(stream)?
+            .ok_or_else(|| HandshakeTimeout(decoder.pending_summary()))?;
         if reply.command == 7 {
             continue;
         }
@@ -183,6 +201,60 @@ fn receive(
         return Ok(reply);
     }
     bail!("Too many unsolicited legacy handshake frames")
+}
+
+fn receive_udp(
+    stream: &mut SslStream<TcpStream>,
+    decoder: &mut LegacyDecoder,
+    command: u16,
+) -> Result<Frame> {
+    receive(stream, decoder, command).map_err(|error| {
+        if error.is::<HandshakeTimeout>() {
+            error.context(UdpUnavailable("Legacy UDP negotiation timed out"))
+        } else {
+            // Session termination, invalid framing and TLS errors are fatal;
+            // they must not trigger another authentication or transport retry.
+            error
+        }
+    })
+}
+
+fn negotiate_udp(
+    stream: &mut SslStream<TcpStream>,
+    decoder: &mut LegacyDecoder,
+    user_id: u32,
+    vip: Ipv4Addr,
+    pending_replies: &mut u8,
+) -> Result<udp::LegacyUdp> {
+    // CHIV is requested with feature value4; the reply transport enum is3.
+    // Never accept static-IV mode2 as a silent fallback.
+    *pending_replies |= PENDING_UDP_KEY;
+    write_frame(stream, user_id, 13, &4u32.to_be_bytes())?;
+    let key_reply =
+        receive_udp(stream, decoder, 13).context("Receiving legacy UDP key negotiation")?;
+    *pending_replies &= !PENDING_UDP_KEY;
+    if key_reply.payload.len() < 20 || u32_at(&key_reply.payload, 0)? != 3 {
+        bail!(UdpUnavailable(
+            "Gateway did not negotiate legacy CHIV UDP mode3"
+        ));
+    }
+    let key = Zeroizing::new(key_reply.payload[4..20].try_into()?);
+    *pending_replies |= PENDING_UDP_PORT;
+    write_frame(stream, user_id, 26, &4u32.to_be_bytes())?;
+    let port_reply =
+        receive_udp(stream, decoder, 26).context("Receiving legacy UDP port negotiation")?;
+    *pending_replies &= !PENDING_UDP_PORT;
+    if port_reply.payload.len() < 2 {
+        bail!(UdpUnavailable("Missing negotiated legacy UDP port"));
+    }
+    let port = u16::from_be_bytes([port_reply.payload[0], port_reply.payload[1]]);
+    let mut peer = stream.get_ref().peer_addr()?;
+    peer.set_port(port);
+    let mut udp = udp::LegacyUdp::new(peer, vip, user_id, key)
+        .context(UdpUnavailable("Legacy CHIV UDP could not be established"))?;
+    udp.establish()
+        .context(UdpUnavailable("Legacy CHIV UDP could not be established"))?;
+    Ok(udp)
 }
 struct NetworkConfig {
     vip: Ipv4Addr,
@@ -268,6 +340,7 @@ pub(super) struct LegacyChannel {
     last_keepalive: Instant,
     last_control_read: Instant,
     udp: Option<udp::LegacyUdp>,
+    pending_tls_controls: u8,
 }
 impl LegacyChannel {
     pub fn send_packet(&mut self, packet: &[u8]) -> Result<()> {
@@ -287,6 +360,18 @@ impl LegacyChannel {
         let Some(frame) = self.decoder.read(&mut self.stream)? else {
             return Ok(None);
         };
+        let pending = match frame.command {
+            13 => PENDING_UDP_KEY,
+            26 => PENDING_UDP_PORT,
+            16 => PENDING_TLS_SWITCH,
+            _ => 0,
+        };
+        if self.pending_tls_controls & pending != 0 {
+            // A timed-out UDP negotiation may reply after cmd16 was sent.
+            // Consume only the specific outstanding responses, once each.
+            self.pending_tls_controls &= !pending;
+            return Ok(None);
+        }
         match frame.command {
             2 => {
                 ensure!(
@@ -362,8 +447,9 @@ pub(super) fn connect(
     profile: &Profile,
     auth_stream: SslStream<TcpStream>,
     auth: LegacyAuth,
+    status: &mut dyn FnMut(&str),
 ) -> Result<Gateway> {
-    match connect_inner(profile, auth_stream, auth.user_id, auth.random_id) {
+    match connect_inner(profile, auth_stream, auth.user_id, auth.random_id, status) {
         Ok(mut gateway) => {
             if let DataChannel::Legacy(channel) = &mut gateway.data {
                 channel.auth = Some(auth);
@@ -396,6 +482,7 @@ fn connect_inner(
     auth_stream: SslStream<TcpStream>,
     user_id: u32,
     session_id: u32,
+    status: &mut dyn FnMut(&str),
 ) -> Result<Gateway> {
     ensure!(
         user_id != 0,
@@ -444,35 +531,45 @@ fn connect_inner(
     let reply =
         receive(&mut stream, &mut decoder, 3).context("Receiving legacy IPv4 allocation")?;
     let config = network_config(&reply.payload)?;
-    let udp = if profile.transport == TransportMode::Udp {
-        ensure!(
-            profile.allow_legacy_udp,
-            "Legacy UDP requires explicit compatibility opt-in"
-        );
-        // CHIV is requested with feature value4; the reply transport enum is3.
-        // Never accept static-IV mode2 as a silent fallback.
-        write_frame(&mut stream, user_id, 13, &4u32.to_be_bytes())?;
-        let key_reply = receive(&mut stream, &mut decoder, 13)
-            .context("Receiving legacy UDP key negotiation")?;
-        ensure!(
-            key_reply.payload.len() >= 20 && u32_at(&key_reply.payload, 0)? == 3,
-            "Gateway did not negotiate legacy CHIV UDP mode3; select TLS"
-        );
-        let key = Zeroizing::new(key_reply.payload[4..20].try_into()?);
-        write_frame(&mut stream, user_id, 26, &4u32.to_be_bytes())?;
-        let port_reply = receive(&mut stream, &mut decoder, 26)
-            .context("Receiving legacy UDP port negotiation")?;
-        ensure!(
-            port_reply.payload.len() >= 2,
-            "Missing negotiated legacy UDP port"
-        );
-        let port = u16::from_be_bytes([port_reply.payload[0], port_reply.payload[1]]);
-        let mut peer = stream.get_ref().peer_addr()?;
-        peer.set_port(port);
-        let mut udp = udp::LegacyUdp::new(peer, config.vip, user_id, key)?;
-        udp.establish()?;
-        Some(udp)
+    let mut pending_tls_controls = 0;
+    let udp = if legacy_udp_enabled(profile) {
+        status("Negotiating Huawei legacy CHIV UDP");
+        if profile.transport == TransportMode::Auto {
+            stream
+                .get_ref()
+                .set_read_timeout(Some(Duration::from_secs(3)))?;
+        }
+        match negotiate_udp(
+            &mut stream,
+            &mut decoder,
+            user_id,
+            config.vip,
+            &mut pending_tls_controls,
+        ) {
+            Ok(udp) => {
+                status("Huawei legacy CHIV UDP established");
+                Some(udp)
+            }
+            Err(error)
+                if profile.transport == TransportMode::Auto && error.is::<UdpUnavailable>() =>
+            {
+                status("Huawei legacy UDP unavailable; switching to TLS");
+                // Match native fallback: write cmd16 on the same authenticated
+                // NEM TLS connection. No mandatory ACK has been observed; an
+                // optional reply and late key/port responses are drained later.
+                write_frame(&mut stream, user_id, 16, &[])
+                    .context("Switching legacy UDP transport back to TLS")?;
+                pending_tls_controls |= PENDING_TLS_SWITCH;
+                status("Huawei legacy TLS selected");
+                None
+            }
+            Err(error) => return Err(error),
+        }
     } else {
+        if profile.crypto == CryptoMode::GmTls13 {
+            status("GM TLS policy excludes legacy UDP");
+        }
+        status("Huawei legacy TLS selected");
         None
     };
     let tls_cipher = stream
@@ -511,6 +608,7 @@ fn connect_inner(
             last_keepalive: now,
             last_control_read: now,
             udp,
+            pending_tls_controls,
         })),
         control: None,
         control_decoder: Decoder::default(),
@@ -522,9 +620,31 @@ fn connect_inner(
     })
 }
 
+fn legacy_udp_enabled(profile: &Profile) -> bool {
+    profile.crypto == CryptoMode::Standard && profile.transport != TransportMode::Tls
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn legacy_udp_selection_uses_negotiated_transport_and_crypto_not_old_flag() {
+        for allow_legacy_udp in [false, true] {
+            for transport in [TransportMode::Auto, TransportMode::Tls, TransportMode::Udp] {
+                let mut profile = Profile {
+                    transport,
+                    allow_legacy_udp,
+                    ..Profile::default()
+                };
+                assert_eq!(
+                    legacy_udp_enabled(&profile),
+                    transport != TransportMode::Tls
+                );
+                profile.crypto = CryptoMode::GmTls13;
+                assert!(!legacy_udp_enabled(&profile));
+            }
+        }
+    }
     #[test]
     fn fixed_network_config_checks_count_masks_and_networks() {
         let mut bytes = vec![0; 12476];

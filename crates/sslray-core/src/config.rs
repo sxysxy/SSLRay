@@ -51,6 +51,8 @@ pub struct Profile {
     pub crypto: CryptoMode,
     pub routes: Vec<String>,
     pub use_server_routes: bool,
+    /// Retained for reading older profiles; transport is negotiated per connection.
+    /// This field no longer enables or disables legacy CHIV UDP.
     pub allow_legacy_udp: bool,
     pub route_mode: RouteMode,
     pub mtu: u16,
@@ -87,6 +89,10 @@ impl Profile {
     }
 
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.crypto != CryptoMode::GmTls13 || self.transport != TransportMode::Udp,
+            "Strict GM TLS mode cannot use AES UDP transport; select TLS or Auto"
+        );
         if self.protocol == VpnProtocol::OpenVpn {
             ensure!(
                 !self.openvpn_config.is_empty()
@@ -190,5 +196,38 @@ mod tests {
         profile.use_server_routes = false;
         assert_eq!(profile.effective_route_mode(), RouteMode::ManualOnly);
         assert!(profile.validate().is_err());
+    }
+
+    #[test]
+    fn old_legacy_udp_flags_remain_readable_without_changing_transport_policy() {
+        for flag in [false, true] {
+            let profile: Profile = serde_json::from_str(&format!(
+                r#"{{"allow_legacy_udp":{flag},"transport":"auto"}}"#
+            ))
+            .unwrap();
+            assert_eq!(profile.allow_legacy_udp, flag);
+            assert_eq!(profile.transport, TransportMode::Auto);
+            profile.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn strict_gm_udp_fails_during_profile_validation() {
+        let mut profile = Profile {
+            crypto: CryptoMode::GmTls13,
+            transport: TransportMode::Udp,
+            ..Profile::default()
+        };
+        assert!(
+            profile
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("GM TLS")
+        );
+        profile.transport = TransportMode::Auto;
+        profile.validate().unwrap();
+        profile.transport = TransportMode::Tls;
+        profile.validate().unwrap();
     }
 }
