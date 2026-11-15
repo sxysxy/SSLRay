@@ -13,3 +13,7 @@ pub mod platform;
 pub mod session;
 #[cfg(windows)]
 pub mod windows_peer;
+#[cfg(windows)]
+mod windows_roots;
+#[cfg(any(windows, test))]
+mod windows_wintun;

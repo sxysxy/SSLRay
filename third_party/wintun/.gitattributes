@@ -1,0 +1,2 @@
+# Preserve the official archive's license bytes, including CRLF line endings.
+LICENSE.txt -text

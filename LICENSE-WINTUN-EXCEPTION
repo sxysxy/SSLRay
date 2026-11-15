@@ -1,0 +1,17 @@
+SSLRay Wintun linking permission
+
+Under section 7 of GNU GPL version 3, the copyright holders of SSLRay grant
+permission to link or combine the SSLRay code to which this permission
+applies with the unmodified Wintun 0.14.1 prebuilt wintun.dll files
+distributed by WireGuard LLC at https://www.wintun.net/ under the Wintun
+Prebuilt Binaries License, using only the Permitted API defined in that
+license, and to convey the resulting combination.
+
+For that combination, Wintun itself need not be licensed under the GNU GPL
+or included in the Corresponding Source. All other applicable GNU GPL
+obligations remain in force, including provision of the Corresponding
+Source for SSLRay and its other covered components.
+
+This permission grants no rights in Wintun and does not alter its license.
+It applies only to SSLRay code whose copyright holders have granted this
+permission, and grants no exception for other third-party code.

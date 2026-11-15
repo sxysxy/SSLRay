@@ -1,12 +1,14 @@
 //! Native Huawei network-extension authentication, distinct from browser login.
 //! Login secrets are URL encoded inside verified TLS only and never logged.
-use crate::{config::Profile, crypto, legacy_http::LegacyAuth};
+use crate::{
+    config::Profile,
+    crypto::{self, TlsStream},
+    legacy_http::LegacyAuth,
+};
 use anyhow::{Context, Result, bail, ensure};
-use openssl::ssl::SslStream;
 use sha2::{Digest, Sha256};
 use std::{
     io::{self, Read, Write},
-    net::TcpStream,
     time::Duration,
 };
 use zeroize::Zeroizing;
@@ -31,7 +33,7 @@ fn stable_mac(profile: &Profile) -> String {
     let s = hex::encode_upper(&h[..6]);
     format!("{}-{}-{}", &s[..4], &s[4..8], &s[8..])
 }
-fn read_body(stream: &mut SslStream<TcpStream>) -> Result<Zeroizing<Vec<u8>>> {
+fn read_body(stream: &mut TlsStream) -> Result<Zeroizing<Vec<u8>>> {
     let mut prefix = [0; 4];
     stream
         .read_exact(&mut prefix)
@@ -62,10 +64,15 @@ fn read_body(stream: &mut SslStream<TcpStream>) -> Result<Zeroizing<Vec<u8>>> {
                     break;
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(_) if status < 0 && body.len() == 4 => {
-                    bail!(
-                        "Native Huawei gateway rejected authentication (status {status}); no automatic retry"
-                    );
+                Err(error)
+                    if status < 0
+                        && body.len() < 84
+                        && matches!(
+                            error.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        ) =>
+                {
+                    break;
                 }
                 Err(error) => {
                     return Err(error).context(format!(
@@ -78,6 +85,13 @@ fn read_body(stream: &mut SslStream<TcpStream>) -> Result<Zeroizing<Vec<u8>>> {
         stream
             .get_ref()
             .set_read_timeout(Some(Duration::from_secs(15)))?;
+        // Short refusals can include trailing bytes and leave TLS open. Only
+        // after EOF/the bounded read deadline can they be distinguished from
+        // complete negative-status SMS challenges; never retry the login.
+        ensure!(
+            status >= 0 || body.len() >= 84,
+            "Native Huawei gateway rejected authentication (status {status}); no automatic retry"
+        );
         ensure!(
             body.len() >= 84,
             "Truncated native Huawei authentication record (status {status}; {} body bytes)",
@@ -158,7 +172,7 @@ fn finish_auth(body: &[u8]) -> Result<LegacyAuth> {
 }
 fn request(
     profile: &Profile,
-    stream: &mut SslStream<TcpStream>,
+    stream: &mut TlsStream,
     path: &str,
     cookie: Option<&str>,
 ) -> Result<Zeroizing<Vec<u8>>> {
@@ -181,7 +195,7 @@ fn request(
 }
 pub fn authenticate_on(
     profile: &Profile,
-    stream: &mut SslStream<TcpStream>,
+    stream: &mut TlsStream,
     password: &str,
     mut challenge: impl FnMut(&str) -> Result<Zeroizing<String>>,
 ) -> Result<LegacyAuth> {

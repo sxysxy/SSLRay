@@ -1,4 +1,8 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+#![cfg_attr(
+    all(windows, not(debug_assertions), not(test)),
+    windows_subsystem = "windows"
+)]
 
 mod certificate_gate;
 mod certificate_ui;
@@ -10,6 +14,8 @@ mod runtime;
 mod system_info;
 mod tray;
 mod ui;
+#[cfg(any(test, all(windows, not(debug_assertions))))]
+mod windows_console;
 
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
@@ -110,6 +116,8 @@ fn credentials(
     Ok((password, otp))
 }
 fn main() -> Result<()> {
+    #[cfg(all(windows, not(debug_assertions), not(test)))]
+    windows_console::prepare_for_cli();
     let cli = Cli::parse();
     if cli.helper {
         return runtime::helper(

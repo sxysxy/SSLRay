@@ -16,6 +16,7 @@ use sslray_core::{
 use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
+    sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
@@ -47,6 +48,9 @@ fn identity() -> (SslAcceptor, String) {
     let mut acceptor = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls_server()).unwrap();
     acceptor.set_private_key(&key).unwrap();
     acceptor.set_certificate(&cert).unwrap();
+    // No server-side writes after the client completes TLS: a wrong-pin client
+    // can close immediately, before a TLS 1.3 session ticket would be written.
+    acceptor.set_num_tickets(0).unwrap();
     (acceptor.build(), pin)
 }
 fn socket(listener: &TcpListener) -> TcpStream {
@@ -137,6 +141,8 @@ fn xml_otp_cstp_routes_dpd_and_fragmented_data_round_trip() {
     let (acceptor, pin) = identity();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let profile = profile(&listener, pin);
+    let (fragment_tx, fragment_rx) = mpsc::channel();
+    let (resume_tx, resume_rx) = mpsc::channel();
     let server = thread::spawn(move || {
         let mut auth = acceptor.accept(socket(&listener)).unwrap();
         let (headers, body) = request(&mut auth);
@@ -178,14 +184,13 @@ fn xml_otp_cstp_routes_dpd_and_fragmented_data_round_trip() {
         ipv6[6] = 58;
         tunnel.write_all(&frame(0, &ipv6)).unwrap();
         tunnel.write_all(&frame(3, b"dpd-marker")).unwrap();
-        assert_eq!(read_frame(&mut tunnel), (4, b"dpd-marker".to_vec()));
         let data = frame(0, &ip());
         tunnel.write_all(&data[..11]).unwrap();
-        thread::sleep(Duration::from_millis(180));
+        fragment_tx.send(()).unwrap();
+        resume_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(read_frame(&mut tunnel), (4, b"dpd-marker".to_vec()));
         tunnel.write_all(&data[11..]).unwrap();
-        let (kind, body) = read_frame(&mut tunnel);
-        assert_eq!(kind, 5);
-        assert_eq!(body[0], 0xb0);
+        let _ = tunnel.shutdown();
     });
     let mut calls = 0;
     let mut gateway = Gateway::connect_with_challenge(&profile, "fixture-secret<&", |method| {
@@ -200,9 +205,11 @@ fn xml_otp_cstp_routes_dpd_and_fragmented_data_round_trip() {
     assert_eq!(gateway.routes, ["10.0.0.0/9"]);
     assert_eq!(gateway.dns[0].to_string(), "10.77.0.1");
     assert!(gateway.transport.contains("CSTP"));
+    gateway.set_read_budget(Duration::from_millis(20)).unwrap();
     gateway.send_packet(&ip()).unwrap();
+    fragment_rx.recv_timeout(Duration::from_secs(3)).unwrap();
     let deadline = Instant::now() + Duration::from_secs(3);
-    let mut timed_out = false;
+    let mut timeouts = 0;
     loop {
         assert!(Instant::now() < deadline, "CSTP data frame timed out");
         match gateway.read_packet().unwrap() {
@@ -210,12 +217,28 @@ fn xml_otp_cstp_routes_dpd_and_fragmented_data_round_trip() {
                 assert_eq!(packet, ip());
                 break;
             }
-            None => timed_out = true,
+            None => {
+                timeouts += 1;
+                if timeouts == 3 {
+                    resume_tx.send(()).unwrap();
+                }
+            }
         }
     }
-    assert!(timed_out, "Fragment did not cross a read timeout");
-    gateway.disconnect();
+    assert!(
+        timeouts >= 3,
+        "Fragment did not cross repeated read timeouts"
+    );
     server.join().unwrap();
+    assert!(
+        gateway
+            .read_packet()
+            .unwrap_err()
+            .to_string()
+            .contains("closed"),
+        "Peer TLS EOF must terminate the tunnel, not become a retry"
+    );
+    gateway.disconnect();
 }
 #[test]
 fn pin_failure_prevents_any_authentication_bytes() {

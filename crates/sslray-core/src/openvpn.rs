@@ -654,9 +654,27 @@ impl PacketBackend for Channel {
     fn read_packet(&mut self) -> Result<Option<Vec<u8>>> {
         let deadline =
             Instant::now() + Duration::from_micros(self.budget_us.load(Ordering::Relaxed));
+        let mut ignored_ipv6 = 0;
         loop {
             match self.rx.try_recv() {
                 Ok(packet) => {
+                    // A Linux server TUN can emit IPv6 neighbor discovery even
+                    // for this IPv4-only client. Discard complete IPv6 packets
+                    // without terminating the working IPv4 session. Keep this
+                    // bounded so unsolicited traffic cannot starve cancellation.
+                    if packet.first().is_some_and(|byte| byte >> 4 == 6) {
+                        ensure!(
+                            packet.len() >= 40
+                                && usize::from(u16::from_be_bytes([packet[4], packet[5]])) + 40
+                                    == packet.len(),
+                            "OpenVPN delivered malformed unsolicited IPv6 data"
+                        );
+                        ignored_ipv6 += 1;
+                        if ignored_ipv6 >= 16 || Instant::now() >= deadline {
+                            return Ok(None);
+                        }
+                        continue;
+                    }
                     ensure!(valid_ipv4(&packet), "OpenVPN delivered malformed IPv4 data");
                     return Ok(Some(packet.to_vec()));
                 }
@@ -945,6 +963,91 @@ pub(crate) fn connect(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn packet_channel() -> (Channel, mpsc::Sender<Bytes>) {
+        let (tx, _) = mpsc::channel(1);
+        let (to_tun, rx) = mpsc::channel(64);
+        let (_, worker_done) = std::sync::mpsc::channel();
+        (
+            Channel {
+                tx: Some(tx),
+                rx,
+                cancel: CancellationToken::new(),
+                worker: None,
+                worker_done,
+                finished: Arc::new(Mutex::new(None)),
+                budget_us: AtomicU64::new(50_000),
+                peer: Ipv4Addr::LOCALHOST,
+            },
+            to_tun,
+        )
+    }
+    fn ipv4_packet() -> Bytes {
+        Bytes::from_static(&[
+            0x45, 0, 0, 20, 0, 1, 0, 0, 64, 1, 0, 0, 10, 88, 0, 1, 10, 88, 0, 2,
+        ])
+    }
+    fn ipv6_neighbor_solicitation() -> Bytes {
+        let mut packet = vec![0; 64];
+        packet[0] = 0x60;
+        packet[4..6].copy_from_slice(&24u16.to_be_bytes());
+        packet[6] = 58;
+        packet[7] = 255;
+        packet[8..10].copy_from_slice(&[0xfe, 0x80]);
+        packet[24..26].copy_from_slice(&[0xff, 0x02]);
+        packet[40] = 135;
+        Bytes::from(packet)
+    }
+
+    #[test]
+    fn unsolicited_ipv6_does_not_disconnect_or_hide_following_ipv4_data() {
+        let (mut channel, to_tun) = packet_channel();
+        to_tun.try_send(ipv6_neighbor_solicitation()).unwrap();
+        to_tun.try_send(ipv4_packet()).unwrap();
+        assert_eq!(channel.read_packet().unwrap(), Some(ipv4_packet().to_vec()));
+        channel.keepalive().unwrap();
+        assert!(!channel.cancel.is_cancelled());
+        to_tun.try_send(ipv4_packet()).unwrap();
+        assert_eq!(channel.read_packet().unwrap(), Some(ipv4_packet().to_vec()));
+    }
+
+    #[test]
+    fn unsolicited_ipv6_batch_yields_then_preserves_queued_ipv4() {
+        let (mut channel, to_tun) = packet_channel();
+        channel.set_read_budget(Duration::from_secs(1)).unwrap();
+        for _ in 0..20 {
+            to_tun.try_send(ipv6_neighbor_solicitation()).unwrap();
+        }
+        to_tun.try_send(ipv4_packet()).unwrap();
+        assert_eq!(channel.read_packet().unwrap(), None);
+        assert!(!channel.cancel.is_cancelled());
+        assert_eq!(channel.read_packet().unwrap(), Some(ipv4_packet().to_vec()));
+    }
+
+    #[test]
+    fn malformed_ipv4_ipv6_and_non_ip_data_remain_errors() {
+        let mut bad_ipv4 = ipv4_packet().to_vec();
+        bad_ipv4[3] = 21;
+        let mut bad_ipv6 = ipv6_neighbor_solicitation().to_vec();
+        bad_ipv6.pop();
+        for (packet, expected) in [
+            (bad_ipv4, "OpenVPN delivered malformed IPv4 data"),
+            (vec![0x45; 12], "OpenVPN delivered malformed IPv4 data"),
+            (
+                b"\x01non-IP data".to_vec(),
+                "OpenVPN delivered malformed IPv4 data",
+            ),
+            (
+                bad_ipv6,
+                "OpenVPN delivered malformed unsolicited IPv6 data",
+            ),
+        ] {
+            let (mut channel, to_tun) = packet_channel();
+            to_tun.try_send(Bytes::from(packet)).unwrap();
+            assert_eq!(channel.read_packet().unwrap_err().to_string(), expected);
+        }
+    }
+
     #[test]
     fn tokenizer_honors_quotes_and_refuses_truncated_input() {
         assert_eq!(

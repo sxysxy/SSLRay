@@ -2,7 +2,9 @@
 
 [English](README.md) | **简体中文**
 
-Rust 实现的 SSL VPN 桌面客户端，使用 egui 界面，支持多 Profile、系统托盘、后台运行、中英文和浅色/深色主题。当前为开发版本，主要验证环境是 macOS Apple Silicon；Linux、Windows 已有平台实现，尚待实机验证。
+Rust 实现的 SSL VPN 桌面客户端，使用 egui 界面，支持多 Profile、系统托盘、后台运行、中英文和浅色/深色主题。0.1.0 各平台的实测范围见[验证记录](docs/VALIDATION.md)。
+
+项目采用 **GPL-3.0-or-later**，附带仅针对 Wintun 的[链接附加许可](LICENSE-WINTUN-EXCEPTION)。见 [LICENSE](LICENSE)、[COPYRIGHT](COPYRIGHT)；第三方组件保留[各自的许可声明](docs/THIRD-PARTY.md)。
 
 | 协议 | 实现范围 | 已验证环境 |
 | --- | --- | --- |
@@ -14,14 +16,14 @@ Rust 实现的 SSL VPN 桌面客户端，使用 egui 界面，支持多 Profile�
 
 ## 编译与启动
 
-需要 Rust 1.95+ 及[平台依赖](docs/PLATFORMS.md)。macOS 默认编译固定版本的官方 OpenSSL 子模块并静态链接，不依赖 Homebrew OpenSSL；需 Xcode 命令行工具、Perl、make 和 Python 3.11+。
+需要 Rust 1.95+ 及[平台依赖](docs/PLATFORMS.md)。各平台的 Cargo 包装脚本编译固定版本的官方 OpenSSL 子模块并静态链接，不依赖 Homebrew OpenSSL。
 
 ```sh
 git submodule update --init third_party/openssl
 ./scripts/cargo-macos.sh run -p sslray --locked
 ```
 
-完整源码 ZIP 已包含 OpenSSL，可跳过 Git 初始化步骤。
+完整源码归档已包含 OpenSSL，可跳过 Git 初始化步骤。
 
 使用相同后端构建 macOS 开发包：
 
@@ -30,7 +32,13 @@ git submodule update --init third_party/openssl
 open dist/SSLRay.app
 ```
 
-脚本收集许可证、加入统一应用图标并做 ad-hoc 签名。Apple Silicon 默认部署目标为 macOS 11.0，会核对主程序和静态 TLS 库的实际要求；旧系统仍待实机验证。Linux/Windows 使用各自工具链和 OpenSSL 开发库。
+脚本收集许可证、加入统一应用图标并做 ad-hoc 签名。Apple Silicon 默认部署目标为 macOS 11.0，旧系统仍待实机验证；公开分发还需 Developer ID 签名与公证。
+
+| 平台 | Cargo 包装脚本 | 打包 |
+| --- | --- | --- |
+| macOS | `scripts/cargo-macos.sh` | `scripts/bundle-macos.sh` → `.app` |
+| Linux | `scripts/cargo-linux.sh` | [Linux 构建](docs/LINUX-BUILD.md) → `.tar.gz` |
+| Windows x64 | `scripts/cargo-windows.ps1` | [Windows 构建](docs/WINDOWS-BUILD.md) → 含官方 Wintun DLL 的 ZIP |
 
 ## 使用
 

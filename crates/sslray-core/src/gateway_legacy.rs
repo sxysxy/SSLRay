@@ -4,14 +4,13 @@
 use super::{DataChannel, Decoder, FRAME_TIMEOUT, Gateway, valid_ipv4};
 use crate::{
     config::{CryptoMode, Profile, TransportMode},
-    crypto,
+    crypto::{self, TlsStream},
     legacy_http::LegacyAuth,
 };
 use anyhow::{Context, Result, bail, ensure};
-use openssl::ssl::SslStream;
 use std::{
     io::{self, Read, Write},
-    net::{Ipv4Addr, TcpStream},
+    net::Ipv4Addr,
     time::{Duration, Instant},
 };
 use zeroize::{Zeroize, Zeroizing};
@@ -177,11 +176,7 @@ fn write_frame(stream: &mut impl Write, user_id: u32, command: u16, payload: &[u
     stream.flush()?;
     Ok(())
 }
-fn receive(
-    stream: &mut SslStream<TcpStream>,
-    decoder: &mut LegacyDecoder,
-    command: u16,
-) -> Result<Frame> {
+fn receive(stream: &mut TlsStream, decoder: &mut LegacyDecoder, command: u16) -> Result<Frame> {
     for _ in 0..8 {
         let reply = decoder
             .read(stream)?
@@ -203,11 +198,7 @@ fn receive(
     bail!("Too many unsolicited legacy handshake frames")
 }
 
-fn receive_udp(
-    stream: &mut SslStream<TcpStream>,
-    decoder: &mut LegacyDecoder,
-    command: u16,
-) -> Result<Frame> {
+fn receive_udp(stream: &mut TlsStream, decoder: &mut LegacyDecoder, command: u16) -> Result<Frame> {
     receive(stream, decoder, command).map_err(|error| {
         if error.is::<HandshakeTimeout>() {
             error.context(UdpUnavailable("Legacy UDP negotiation timed out"))
@@ -220,7 +211,7 @@ fn receive_udp(
 }
 
 fn negotiate_udp(
-    stream: &mut SslStream<TcpStream>,
+    stream: &mut TlsStream,
     decoder: &mut LegacyDecoder,
     user_id: u32,
     vip: Ipv4Addr,
@@ -331,7 +322,7 @@ fn network_config(bytes: &[u8]) -> Result<NetworkConfig> {
 }
 
 pub(super) struct LegacyChannel {
-    stream: SslStream<TcpStream>,
+    stream: TlsStream,
     decoder: LegacyDecoder,
     user_id: u32,
     auth: Option<LegacyAuth>,
@@ -445,7 +436,7 @@ impl LegacyChannel {
 
 pub(super) fn connect(
     profile: &Profile,
-    auth_stream: SslStream<TcpStream>,
+    auth_stream: TlsStream,
     auth: LegacyAuth,
     status: &mut dyn FnMut(&str),
 ) -> Result<Gateway> {
@@ -479,7 +470,7 @@ fn logout(profile: &Profile, auth: &LegacyAuth) -> Result<()> {
 
 fn connect_inner(
     profile: &Profile,
-    auth_stream: SslStream<TcpStream>,
+    auth_stream: TlsStream,
     user_id: u32,
     session_id: u32,
     status: &mut dyn FnMut(&str),

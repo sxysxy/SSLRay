@@ -20,9 +20,9 @@ impl Language {
 }
 
 macro_rules! catalog {
-    ($( $id:ident => ($zh:literal, $en:literal), )*) => {
+    ($( $(#[$variant_attr:meta])* $id:ident => ($zh:literal, $en:literal), )*) => {
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-        pub enum Text { $( $id, )* }
+        pub enum Text { $( $(#[$variant_attr])* $id, )* }
         pub fn text(language: Language, id: Text) -> &'static str {
             match (language, id) {
                 $( (Language::ZhCn, Text::$id) => $zh,
@@ -64,6 +64,7 @@ catalog! {
     Authorization => ("管理员授权", "Administrator authorization"),
     AuthorizationFailed => ("管理员授权未完成", "Administrator authorization not completed"),
     RetryAuthorization => ("重新申请授权", "Retry administrator authorization"),
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     AuthorizeWithPassword => ("使用密码授权", "Authorize with password"),
     AuthorizationRetryHelp => ("请在系统弹窗中完成管理员授权；取消或失败后可以重试。", "Complete administrator authorization in the system dialog. You can retry after cancellation or failure."),
     AuthorizationWindowsHelp => ("Windows 使用 UAC 提升权限。", "Windows uses UAC elevation."),

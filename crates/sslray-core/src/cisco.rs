@@ -4,14 +4,13 @@
 use crate::{
     backend::{BackendConnection, PacketBackend},
     config::{Profile, TransportMode},
-    crypto,
+    crypto::{self, TlsStream},
 };
 use anyhow::{Context, Result, bail, ensure};
-use openssl::ssl::SslStream;
 use std::{
     collections::BTreeMap,
     io::{self, Read, Write},
-    net::{Ipv4Addr, Shutdown, TcpStream},
+    net::{Ipv4Addr, Shutdown},
     time::{Duration, Instant},
 };
 use zeroize::{Zeroize, Zeroizing};
@@ -225,7 +224,7 @@ fn safe_path(profile: &Profile, value: &str) -> Result<String> {
 }
 struct HttpClient<'a> {
     profile: &'a Profile,
-    stream: Option<SslStream<TcpStream>>,
+    stream: Option<TlsStream>,
     identity: Vec<u8>,
     cookies: BTreeMap<String, Zeroizing<String>>,
 }
@@ -244,7 +243,7 @@ impl<'a> HttpClient<'a> {
             cookies: BTreeMap::new(),
         })
     }
-    fn stream(&mut self) -> Result<&mut SslStream<TcpStream>> {
+    fn stream(&mut self) -> Result<&mut TlsStream> {
         if self.stream.is_none() {
             let s = crypto::connect(self.profile)?;
             ensure!(
@@ -743,7 +742,7 @@ fn subtract(route: Cidr, exclude: Cidr, out: &mut Vec<Cidr>) -> Result<()> {
     Ok(())
 }
 struct CiscoChannel {
-    stream: SslStream<TcpStream>,
+    stream: TlsStream,
     decoder: Decoder,
     vip: Ipv4Addr,
     mtu: usize,

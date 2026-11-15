@@ -13,7 +13,6 @@ openssl.workspace = true
 libc.workspace = true
 sha2 = "0.10"
 hex = "0.4"
-tun = "0.8.14"
 roxmltree = "0.21"
 vpn-core = { path = "../../third_party/omnitun/crates/vpn-core" }
 vpn-openvpn = { path = "../../third_party/omnitun/crates/vpn-openvpn" }
@@ -22,11 +21,16 @@ tokio-util = { version = "0.7", features = ["rt"] }
 bytes = "1"
 async-trait = "0.1"
 
+[target.'cfg(unix)'.dependencies]
+tun = "0.8.14"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.4"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 wintun-bindings = { version = "0.7.40", features = ["verify_binary_signature"] }
+libloading = "0.9"
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_Security_WinTrust", "Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 rpassword = "7"

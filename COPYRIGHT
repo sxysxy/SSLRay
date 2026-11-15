@@ -1,0 +1,21 @@
+SSLRay
+Copyright (c) 2026 SSLRay contributors
+
+SSLRay is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option)
+any later version.
+
+The SSLRay copyright holders additionally grant the limited Wintun linking
+permission in LICENSE-WINTUN-EXCEPTION. It does not alter Wintun's own
+license or grant an exception for other third-party code.
+
+SSLRay is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE. See the GNU General Public License for details.
+
+You should have received a copy of the GNU General Public License along
+with SSLRay. If not, see <https://www.gnu.org/licenses/>.
+
+Third-party components retain their original licenses and notices; see
+docs/THIRD-PARTY.md and the bundled ThirdPartyLicenses/INDEX.json.

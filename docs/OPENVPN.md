@@ -21,11 +21,17 @@ OTPs are obtained through a callback for each challenge. Subsequent authenticati
 
 Unsupported: TAP, IPv6, CBC data channels, static-key mode, `tls-crypt-v2`, proxies, compressed data, Web/SAML, CR_TEXT and unimplemented TLS-version constraints. Scripts/plugins are not executed, password files are not read, and unknown security directives are rejected. Only compatibility framing with uncompressed data is accepted. This protocol uses rustls/ring and does not support GM TLS.
 
+An IPv4 session can receive unsolicited IPv6 neighbor-discovery traffic from a server TUN. Complete IPv6 packets are discarded without ending the IPv4 session; packet length checks, a bounded batch and the read deadline still apply. Malformed IPv4/IPv6 or non-IP data remains an error. This does not enable IPv6 connectivity or routing.
+
 Routing protects the actual socket peer and follows SSLRay's shared policy; pushed `redirect-gateway` does not enable a full tunnel without explicit selection. Connection setup has a 120-second budget. Disconnect removes session routes before closing the engine/interface, waiting at most three seconds for the background thread. System DNS calls cannot be forcibly interrupted but do not hold VPN credentials.
 
 ## Local reproduction
 
-macOS Apple Silicon passed certificate authentication, CA/CN policies, AES-256-GCM/UDP ICMP round trips and wrong-fingerprint rejection against Docker OpenVPN 2.6.20 / OpenSSL 3.3.7. The following two tests do not create a host TUN or modify host routes; separate system utun/split-routing results are in [VALIDATION.md](VALIDATION.md). TCP, password/MFA, `tls-auth`/`tls-crypt`, long-running rekeying and Windows/Linux interoperability still need validation.
+macOS Apple Silicon passed certificate authentication, CA/CN policies, AES-256-GCM/UDP ICMP round trips and wrong-fingerprint rejection against Docker OpenVPN 2.6.20 / OpenSSL 3.3.7. The following two tests do not create a host TUN or modify host routes; separate system utun/split-routing results are in [VALIDATION.md](VALIDATION.md).
+
+On 2026-11-15, the final native Linux and Windows executables also passed mutual-certificate UDP / AES-256-GCM against a temporary OpenVPN 2.7.0 reference server. Linux used the privileged CLI with explicit sudo, host `tun0`, VIP `10.88.0.2`, MTU 1400 and only `10.88.0.1/32`: ping 2/2, TX/RX 168 bytes each, SIGINT exit 0 and matching route/interface baselines after cleanup. Windows used the GUI, real UAC and official Wintun 0.14.1 with the same VIP/MTU and single manual `/32`: 8/8 replies in the first session, disconnect cleanup, then 2/2 after reconnecting with the same elevated helper and no new UAC. Final disconnect cleaned up again; SSLRay installed no default route, and outer connectivity and the original default route were preserved.
+
+These reference tests used fresh certificate fixtures and no company VPN account. They establish this tested certificate/UDP combination and host interface/route handling, not company Huawei access, general hardware compatibility, Linux desktop polkit interaction or every OpenVPN option. TCP, password/MFA, `tls-auth`/`tls-crypt`, long-running rekeying and other algorithm/server combinations still need interoperability validation. Detailed boundaries and evidence locations are in [VALIDATION.md](VALIDATION.md).
 
 ```sh
 docker compose -f tests/vpn-lab/compose.yaml up -d --build openvpn

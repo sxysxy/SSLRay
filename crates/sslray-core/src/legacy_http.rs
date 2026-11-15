@@ -1,11 +1,9 @@
 //! Bounded HTTP authentication for legacy Huawei NEM gateways. Redirects are
 //! parsed locally; secrets are never forwarded to a redirected host.
-use crate::config::Profile;
+use crate::{config::Profile, crypto::TlsStream};
 use anyhow::{Context, Result, bail, ensure};
-use openssl::ssl::SslStream;
 use std::{
     io::{Read, Write},
-    net::TcpStream,
     time::{Duration, Instant},
 };
 use zeroize::Zeroizing;
@@ -167,7 +165,7 @@ fn form_escape(value: &str) -> Zeroizing<String> {
     }
     result
 }
-fn post(profile: &Profile, stream: &mut SslStream<TcpStream>, body: &str) -> Result<Response> {
+fn post(profile: &Profile, stream: &mut TlsStream, body: &str) -> Result<Response> {
     let request = Zeroizing::new(format!(
         "POST /login.html HTTP/1.1\r\nHost: {}:{}\r\nUser-Agent: SSLRay/0.1\r\nAccept: */*\r\nAccept-Encoding: identity\r\nX-Client-OS: SSLRay\r\nConnection: Keep-Alive\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{}",
         profile.host,
@@ -181,7 +179,7 @@ fn post(profile: &Profile, stream: &mut SslStream<TcpStream>, body: &str) -> Res
 }
 pub fn authenticate_on(
     profile: &Profile,
-    stream: &mut SslStream<TcpStream>,
+    stream: &mut TlsStream,
     password: &str,
     mut challenge: impl FnMut(&str) -> Result<Zeroizing<String>>,
 ) -> Result<LegacyAuth> {

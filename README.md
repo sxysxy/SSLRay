@@ -2,7 +2,9 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-A Rust SSL VPN desktop client with an egui interface, named profiles, a system tray, background operation, Chinese/English localization, and light/dark themes. This is a development version, primarily validated on macOS Apple Silicon. Linux and Windows implementations still require testing on those systems.
+A Rust SSL VPN desktop client with an egui interface, named profiles, a system tray, background operation, Chinese/English localization, and light/dark themes. See the [platform validation record](docs/VALIDATION.md) for the tested scope of version 0.1.0.
+
+Licensed under **GPL-3.0-or-later** with the [Wintun linking permission](LICENSE-WINTUN-EXCEPTION). See [LICENSE](LICENSE), [COPYRIGHT](COPYRIGHT), and the [third-party notices](docs/THIRD-PARTY.md).
 
 | Protocol | Implementation | Validated environment |
 | --- | --- | --- |
@@ -14,14 +16,14 @@ Only IPv4 traffic is carried. System DNS changes, a kill switch, and automatic r
 
 ## Build and run
 
-Requires Rust 1.95+ and the [platform dependencies](docs/PLATFORMS.md). macOS builds compile the pinned official OpenSSL submodule and link it statically, without Homebrew OpenSSL. Xcode command-line tools, Perl, make, and Python 3.11+ are required.
+Requires Rust 1.95+ and the [platform dependencies](docs/PLATFORMS.md). The platform wrappers compile the pinned official OpenSSL submodule and link it statically, without Homebrew OpenSSL.
 
 ```sh
 git submodule update --init third_party/openssl
 ./scripts/cargo-macos.sh run -p sslray --locked
 ```
 
-The complete source ZIP already contains OpenSSL; its Git initialization step can be skipped.
+The complete source archive contains OpenSSL; its Git initialization step can be skipped.
 
 Build a macOS development bundle with the same backend:
 
@@ -30,7 +32,13 @@ Build a macOS development bundle with the same backend:
 open dist/SSLRay.app
 ```
 
-The script collects licenses, includes the shared application icon, and applies an ad-hoc signature. The default Apple Silicon deployment target is macOS 11.0; the executable and static TLS libraries are checked against it. Older macOS versions still require runtime validation. Linux/Windows use their native toolchains and OpenSSL development libraries.
+The script collects licenses, includes the shared application icon, and applies an ad-hoc signature. The default Apple Silicon deployment target is macOS 11.0; older systems still require runtime validation. Public macOS distribution additionally needs Developer ID signing and notarization.
+
+| Platform | Cargo wrapper | Packaging |
+| --- | --- | --- |
+| macOS | `scripts/cargo-macos.sh` | `scripts/bundle-macos.sh` → `.app` |
+| Linux | `scripts/cargo-linux.sh` | [Linux build](docs/LINUX-BUILD.md) → `.tar.gz` |
+| Windows x64 | `scripts/cargo-windows.ps1` | [Windows build](docs/WINDOWS-BUILD.md) → ZIP with the official Wintun DLL |
 
 ## Connect
 

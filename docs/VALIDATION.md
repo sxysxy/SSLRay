@@ -1,56 +1,40 @@
-# 验证状态
+# 0.1.0 验证记录
 
-最近测试：2026-11-15，macOS 27.2.1 / Apple Silicon。最近一轮验证条件指纹授权与单次密码回退的状态清理；未触发真实系统认证、网关登录或系统网络修改。证书、自动旧版 UDP、错误展示及布局的此前记录保留如下。
+更新：2026-11-15。三平台最终代码已完成构建、回归及下述范围的运行检查。下表区分受控 OpenVPN 参考服务、此前真实网关实测及尚未通过的企业接入，不将本轮结果扩展到未测试的系统、硬件或协议组合。
 
-## 自动检查
+## 本轮平台检查
 
-| 项目 | 最近记录 | 范围 |
+| 平台 | 构建与回归 | 已验证运行范围 | 边界 |
+| --- | --- | --- | --- |
+| macOS arm64 | **174 通过、4 忽略**；fmt、全 targets Clippy `-D warnings` 通过 | `.app`、CLI 0.1.0、统一图标、静态 OpenSSL 4.0.3、国密能力检查、ZIP 重解压 440 文件及权限一致 | 目标 macOS 11.0，未在旧系统或 Intel 实机运行；ad-hoc 签名，未公证，Gatekeeper 不接受其为已认证分发 |
+| Linux x86_64 | **164 通过、4 忽略**；全 targets Clippy `-D warnings` 通过，最终 UI 的 73 项 app 测试与严格 Clippy 再次通过 | manylinux 2.28 构建、Ubuntu 原生启动；最终 CLI 经显式 sudo 建立宿主 TUN、仅测试目标 `/32`，OpenVPN 参考服务 ping 2/2 及清理通过；另有隔离命名空间 TUN 测试 | ELF 最高要求 GLIBC 2.28；此前 Xvfb 界面截图未在最后日志布局修正后重拍；桌面托盘及 polkit 人工交互未验收，企业网关数据仍未通过 |
+| Windows x64 | **158 通过、4 忽略**；全 targets Clippy `-D warnings`、原生 release、静态 CRT/OpenSSL、官方 Wintun 0.14.1 哈希与 Authenticode 检查通过 | 真实 UAC、官方 Wintun、VIP/MTU、受限 `/32`、OpenVPN 参考服务 ICMP、断开清理及同一管理员 helper 重连复用通过；日志列表可见，深色英文检查后恢复中文浅色并退出 | 本次主机及证书认证/UDP 组合的实测，不代表其他 Windows 版本、硬件、全部 OpenVPN 选项或企业华为网关已通过 |
+
+三端平台包装脚本使用固定的项目 OpenSSL 源码，运行不需要系统 OpenSSL。macOS 动态导入仅含 Apple 系统库；Linux 无动态 `libssl` / `libcrypto` 和绝对 RPATH。Windows 已修复读超时使 OpenSSL 会话永久失效的问题，回归覆盖连续超时后恢复收包、分片及 EOF；仅看到 `gm_tls13=true` 仍不代表实际国密网关握手通过。
+
+应用与核心的非测试代码禁止直接 `unwrap` / `expect`。回归覆盖证书预检与指纹、OTP、Base64 凭据隔离、Profile、路由事务、helper 复用、i18n、布局和错误摘要。短负认证响应保留网关状态码，不再误报为系统读取超时；完整短信挑战与不自动重复登录的策略不变。新增 3 项 OpenVPN 回归覆盖忽略完整 IPv6 数据后继续 IPv4 会话、有限读取预算，以及继续拒绝损坏的 IPv4/IPv6 和非 IP 数据；这不提供 IPv6 接入或路由。
+
+## 网络与授权范围
+
+| 场景 | 已验证结果 | 尚未覆盖 |
 | --- | --- | --- |
-| 工作区回归 | **160 通过、0 失败、4 忽略** | 项目静态 OpenSSL；协议、路由、证书、OTP、i18n、配置/凭据、helper 与会话适配器 |
-| 证书预检与选择 | 8 项本地 TLS + 12 项应用状态检查通过 | 自签名/过期/名称不符、正常 CA、坏签名硬失败、错误/变化 pin、预检无应用数据、目标绑定与迟到结果、仅本次及记住后重载、未授权密码/OTP 不落盘 |
-| 项目 OpenSSL 4.0.3 | **9 通过、0 跳过** | 独立静态后端：TLS/证书 pin、第二密码、原生记录边界及 RFC 8998 两种 SM4 套件的应用数据往返 |
-| 自动旧版 UDP | 本地协议模拟通过 | 无需旧开关，Auto 同一认证连接回退 TLS；认证/格式错误不回退，国密不降级 |
-| macOS 条件指纹授权 | 8 项新增决策、参数与应用状态检查通过 | 系统 PAM/生物识别可用性决定优先路径；`sudo -k -S` 与空 stdin；尝试后失败不自动二次提权，显式选择系统密码；未触发真实认证 |
-| 参考服务互通 | 前次网络联调 **4 项通过** | OpenVPN 与 ocserv 各 2 项；最近回归未启动容器，未计入本次通过数 |
-| 独立 OpenVPN 引擎 | 前次 **18 项通过** | PRF、控制/数据通道、重放、密钥更新、OTP 不复用和算法策略；不计入工作区 |
-| 格式 / Clippy / 开发包 | 通过 | fmt、`clippy -D warnings`、release 构建、`codesign --verify --deep --strict` |
-| 源码 / 图标 | 通过 | OpenSSL 完整 tree 校验及 8 项导出/篡改反例；统一 PNG/ICO/ICNS 内容、尺寸和 macOS 图标解码 |
+| 真实网关设备：macOS 此前实测 | 华为 TLS/旧版 UDP 的匹配 IP 回复；分别通过 SSLRay utun、单目标 `/32` 完成公钥 SSH，断开清理 | 本轮未再次登录；全部下发路由、合并及全隧道未完成实机验收 |
+| 真实网关设备：Linux 本轮 | 仅 TLS 的预检取得批准的叶证书指纹；一次认证收到负状态 `-5`，未创建 VIP、网卡或路由；宿主 SSH、默认路由及接口与基线一致 | 认证未成功，未重试、未测 UDP，不宣称实际 VPN 数据通过 |
+| 真实网关设备：Windows 本轮 | 企业华为网关证书预检及警告信息；当前测试账号认证未获成功 | 企业华为 TLS/UDP 数据通路仍待验收；下述成功的 Windows OpenVPN 参考测试不替代这一结果 |
+| Linux 隔离 TUN 本轮 | 隐藏 sudo 进入新网络命名空间，现有 core 创建 TUN/MTU 1400，唯一 `198.18.0.2/32`；真实 ICMP 2/2、TX/RX 各 168 字节，显式清理后恢复命名空间基线 | 不使用企业账号、不访问真实网关、不修改宿主业务路由；不能替代 VPN 互通测试 |
+| OpenVPN：macOS 此前实测 | 本地 OpenVPN 2.6.20 UDP / AES-256-GCM、证书认证、IP 往返、错误指纹拒绝；经 macOS utun 系统 ping 2/2 与清理 | 其他 TCP/MFA/算法组合仍待验收 |
+| OpenVPN：Linux 本轮参考服务 | 最终原生 CLI 对临时 OpenVPN 2.7.0 参考服务，双向证书认证、UDP / AES-256-GCM；宿主 `tun0`、VIP `10.88.0.2`、MTU 1400，仅 `10.88.0.1/32`；ping 2/2、TX/RX 各 168 字节，SIGINT 后退出 0，路由与接口恢复基线 | 使用显式 sudo CLI，不等同于桌面 polkit；未使用企业账号，不证明华为网关或其他协议组合互通 |
+| OpenVPN：Windows 本轮参考服务 | 最终 GUI 经真实 UAC 加载官方 Wintun 0.14.1，VIP `10.88.0.2/32`、MTU 1400，仅手动 `10.88.0.1/32`；首次会话 ping 2+6 共 8/8，断开后同一 helper 无新 UAC 重连，另 2/2；两次断开均清理接口/测试路由 | 仅证书认证、UDP / AES-256-GCM 对临时 OpenVPN 2.7.0 服务；未安装 SSLRay 默认路由，外层连接及原默认路由不变，不代表全隧道或企业网关通过 |
+| Cisco 此前实测 | 本地 ocserv 1.6.0 / GnuTLS 3.8.13：密码认证、TLS/CSTP、IP/DNS 往返与错误指纹拒绝 | Cisco 硬件、DTLS、宿主网络完整组合未验证 |
+| 国密与 OTP | 本地 RFC 8998 SM4-GCM/CCM 握手及应用数据、算法向量与模拟挑战通过 | 真实设备的国密、OTP、TLCP 双证书和 USBKey 未验证 |
 
-新 macOS 包为 arm64，主程序及全部 1,124 个 TLS 静态库 Mach-O 成员的最低目标均为 11.0，`Info.plist` 与主程序一致。动态导入仅含 Apple 系统库，无 Homebrew 或 TLS 动态库；运行时报告 OpenSSL 4.0.3、`gm_tls13=true`。未在 macOS 11 或 Intel 上运行验证。Windows ICO 已接入可执行文件资源，尚未在 Windows 构建或检查外观。
+macOS 指纹授权按 PAM/LocalAuthentication 可用性选择，决策与失败状态有自动测试；本轮没有触发真实 Touch ID 或系统密码认证。Linux 的隔离 sudo 和宿主 OpenVPN sudo CLI 测试均不代表桌面 polkit 已验收。helper 的 10 分钟空闲与 1 小时授权期限由自动测试覆盖；Windows 本轮首次连接完成真实 UAC，断开重连复用同一 helper，并实际记录“Reusing administrator authorization”，没有第二次 UAC。
 
-## 网络实测
+Windows 本轮人工确认日志列表的 4 行事件可见；英文深色检查后恢复中文浅色，接受退出。Linux 最终原生包的日志修正通过测试与 Clippy，未借用 Windows 截图宣称 Linux 最终界面已重拍。参考服务、监听端口、临时配置均已清理；受控服务端收到 Windows 10 组及 Linux 2 组 ICMP 请求/回复，过滤后的报文及基线材料保存在发行目录的 `reference-openvpn-validation/`，Windows 客户端证据另在 `windows-validation/`。两类材料分别验证数据到达与客户端清理，不互相替代。
 
-| 场景 | 已验证结果 | 边界 |
-| --- | --- | --- |
-| 真实网关设备（华为）TLS | 原生认证、8 条下发路由、匹配的 DNS 与 ICMP 回复 | 纯 IP 探测不修改宿主接口、路由或 DNS |
-| 真实网关设备（华为）旧版 UDP | 前次显式 CHIV3 / AES-128-CBC，收到同目标的匹配 ICMP 回复 | 无逐包 MAC；本次自动协商与回退由本地模拟覆盖，未再次登录真实设备 |
-| 真实网关设备 TLS / UDP 宿主 SSH | 各经 SSLRay utun 和单目标 `/32`，公钥 SSH 静态命令退出 0；Ctrl-C 后自有接口和路由清理 | 禁用 SSH 代理/复用并严格检查 host key；未安装真实网关设备的全部路由 |
-| OpenVPN 2.6.20 | UDP / AES-256-GCM 证书认证、纯 IP ICMP 往返及错误指纹拒绝；默认 `gateway_only` 经 utun 系统 ping **2/2**，断开清理 | 本地 Docker 参考服务；不代表 TCP/MFA 等其他组合均通过 |
-| ocserv 1.6.0 / GnuTLS 3.8.13 | 密码认证、TLS/CSTP、纯 IP ICMP/DNS 往返及错误指纹拒绝 | 本地参考服务；未测 Cisco 硬件或该协议的宿主路由 |
-| 国密 / OTP | 本地 RFC 8998 握手及应用数据、算法向量、模拟挑战通过 | 未验证真实网关设备的国密或 OTP；详见[国密记录](GM-VALIDATION.md) |
-| 真实网关设备证书预检 | TLS 1.2 / ECDHE-RSA-AES256-GCM-SHA384；报告自签名链及主机名不符，取得指纹及有效期 | 不发送用户名、密码、HTTP/NEM 数据，不代表本次已完成 VPN 登录；过期场景由本地证书测试覆盖 |
+## 复验
 
-真实网关设备默认下发的八条分流路由的完整系统复验尚未完成验收：最后一次因 macOS 授权等待超时未进入安装阶段。另一个活动 VPN 可重装相同网段路由、改变实际出口，联调应避免并发 VPN 干扰。
-
-## GUI、配置与授权
-
-- 已人工检查：按名称选择/新建 Profile、重启恢复选择、软件设置、浅色/深色、中英文、适配器/IP/MTU、版本、分流路由列表及空手动列表、菜单 Quit。
-- 本次已打开新包检查软件设置：未连接时仅提示连接后显示 SSLRay 网卡，不列出系统其他接口；后端显示 OpenSSL 4.0.3。连接后的精确接口匹配、断开清空及同名重连旧结果隔离通过自动测试，未再次连接网关人工检查。
-- 原生文件框已成功选择 `.ovpn` 并回填路径；密码保存确认框已检查本地路径、云端与泄露提示。
-- 已人工检查接入配置、网卡刷新、日志及 MTU 标题行的居中对齐；主密码框内的眼睛按钮可切换掩码/明文，本地保存选项紧邻下方。临时密码弹窗使用同一控件，取消后清空并恢复隐藏；该检查未提交登录或申请管理员权限。
-- 本次错误使用中英文短摘要，技术详情默认折叠并限高；证书弹窗仅正文滚动，记住选项与操作按钮固定底部。保存密码的完整说明仅在确认弹窗展示。
-- 本次真实组件的隔离离屏检查通过：中英文证书弹窗在 1060×790 和 940×650 下底部控件可见、正文滚动后位置不变；10 KB 技术详情展开限高 160，提示关闭按钮不漂移；路由/日志在 800 内容宽并排、600 内容宽堆叠且无重叠。当前桌面未取得可用窗口截图，本轮尚未人工复验最终外观；预览不读取用户配置或连接网络。
-- 自有应用及核心的非测试业务代码禁止直接 `unwrap` / `expect`；运行失败通过错误上下文上报。测试与上游依赖不在此限制内。
-- Base64 存储测试覆盖旧明文升级、严格解码、边界与冲突拒绝、0600、配置损坏保护及密码隔离。
-- helper 复用、10 分钟空闲/1 小时授权期限、父进程断开、重叠会话拒绝、授权失败分类和显式重试通过 IPC/状态测试；新复用实现未再次实测系统弹窗次数。
-- 指纹授权本轮只读核对 Apple `pam_tid`/sudo 源码及本机机制，覆盖自动选择与命令参数测试；未修改 PAM/授权数据库，未真实执行生物识别或系统密码提权，也未以该路径连接实机。取消与其他失败不依赖退出码区分，均不自动二次启动 helper；机制和来源见[权限说明](PLATFORMS.md#helper-与授权)。
-- 已在非特权本机复现 macOS 接入流继承 `O_NONBLOCK`，导致授权后读握手立即返回 `EAGAIN / os error 35`；仅设置读取超时无效。现对已接入流恢复阻塞，监听端仍非阻塞；nonce/Ready 按总期限等待并保留分片，取消后不发送 Connect。另覆盖对端关闭后仍有缓存数据的读取。本次未触发真实管理员授权、创建网卡或修改路由，完整授权流程仍需使用新包实测。
-
-尚待验收：Linux/Windows 运行时、Cisco 宿主网络、真实网关设备全部下发路由/合并策略、IPv4 全隧道、真实 OTP、更多认证组合、长期稳定性，以及崩溃/强退/活跃 GUI 退出等完整清理场景。托盘 Restore 与真实 OTP 弹窗也未完成人工验收。
-
-## 复验入口
-
-在仓库根目录执行；普通测试不连接真实网关设备。macOS 将下列 `cargo` 替换为 `./scripts/cargo-macos.sh`，以使用项目后端：
+在仓库根目录使用对应平台的 Cargo 包装脚本，详见 [平台说明](PLATFORMS.md)、[Linux 构建](LINUX-BUILD.md)及 [Windows 构建](WINDOWS-BUILD.md)：
 
 ```sh
 cargo fmt --all -- --check
@@ -60,11 +44,6 @@ cargo run -p sslray -- capabilities
 cargo test -p sslray-core --test gm_tls -- --nocapture
 ```
 
-`gm_tls` 在后端不支持时会输出跳过原因；仅看到 `ok` 不能证明国密握手成功。服务准备好后再执行实际互通测试：
+普通测试只访问本地模拟服务。4 项容器互通测试默认忽略；准备好服务后可分别运行 `openvpn_interop`、`cisco_interop`，使用 `--ignored --test-threads=1`，见 [OpenVPN](OPENVPN.md)、[Cisco](CISCO.md)。
 
-```sh
-cargo test -p sslray-core --test openvpn_interop --locked -- --ignored --test-threads=1
-cargo test -p sslray-core --test cisco_interop --locked -- --ignored --test-threads=1
-```
-
-容器准备及停止方法见 [OpenVPN](OPENVPN.md)、[Cisco](CISCO.md)；实验材料保存在忽略的 `work/`，不作为应用产物。真实网关设备的纯 IP 探测入口为 `sslray-core` 的 `probe_data` 示例；宿主联调用 CLI `connect`，凭据仅通过隐藏输入或显式 stdin 提供。文档、日志和版本库均不应包含密码、OTP、令牌、私钥或未脱敏抓包。
+真实设备的纯 IP 探测使用 `sslray-core` 的 `probe_data` 示例；宿主测试用 CLI `connect`，凭据仅通过隐藏输入或显式 stdin 提供。先核对证书、保护外层连接并限制测试路由，断开后复核基线。实验材料保存在忽略的 `work/`；文档、版本库和发行包不包含本次企业接入的真实密码、OTP、令牌、私钥或原始认证报文。完整源码归档保留上游公开的测试样例与测试密钥，它们不属于本次企业接入凭据。

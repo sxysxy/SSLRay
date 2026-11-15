@@ -2,21 +2,21 @@
 
 ## 平台依赖
 
-公共要求：Rust 1.95+。macOS 默认使用项目 OpenSSL 子模块；其他平台需兼容的本地 OpenSSL 开发库或自建同源后端。
+公共要求：Rust 1.95+。各平台包装脚本默认编译项目固定的 OpenSSL 子模块并静态链接；不需要 Homebrew 或系统 OpenSSL 开发库。构建需要 Perl、Python 3.11+ 及对应的原生 C 工具链。
 
 | 系统 | 虚拟网卡 / 路由 | 系统授权 | 额外依赖 |
 | --- | --- | --- | --- |
 | macOS | 动态编号 `utunN` / `/sbin/route` | 条件优先 Touch ID，系统管理员弹窗备用 | Xcode 命令行工具、Perl、make、Python 3.11+ |
 | Linux | `/dev/net/tun` / iproute2 | polkit `pkexec` | iproute2、polkit 及桌面认证代理；GUI 依赖见下方 |
-| Windows | Wintun / `netsh store=active` | UAC `RunAs` | MSVC、OpenSSL（如 vcpkg）、匹配架构的签名 `wintun.dll` |
+| Windows | Wintun / `netsh store=active` | UAC `RunAs` | MSVC、Windows SDK、原生 Windows Perl、匹配架构的官方 Wintun 0.14.1 `wintun.dll` |
 
 Debian/Ubuntu GUI 构建依赖：
 
 ```sh
-sudo apt install build-essential pkg-config libssl-dev libgtk-3-dev libayatana-appindicator3-dev libxkbcommon-dev
+sudo apt install build-essential pkg-config perl python3 libgtk-3-dev libayatana-appindicator3-dev libxkbcommon-dev
 ```
 
-Linux 托盘需桌面支持 AppIndicator。Windows 的 `wintun.dll` 从[官方](https://www.wintun.net/)获取并放在可执行文件旁；helper 只从该目录加载并核验签名，每次创建独立接口。正式分发应保护程序及 DLL 安装目录，并完成相应签名、公证和安装包审核。
+Linux 托盘需桌面支持 AppIndicator。Windows 的 `wintun.dll` 使用[官方 Wintun 0.14.1](https://www.wintun.net/builds/wintun-0.14.1.zip) 归档内匹配架构的原始文件，放在可执行文件旁；来源、归档与各架构 DLL 的 SHA-256 见[来源说明](../third_party/wintun/README.md)。helper 从该目录的绝对路径打开 DLL，保持仅共享读取的文件句柄，先核对固定 SHA-256 并通过 `WinVerifyTrust` 验证签名，再用 `LoadLibraryExW` 加载；依赖库搜索限于系统目录。其它版本、内容被修改或签名验证失败时拒绝加载，每次连接创建独立接口。正式分发应保护程序及 DLL 安装目录，附带 Wintun 原始许可证，并完成应用签名和安装包审核。Windows 原生构建及运行验收状态见[验证状态](VALIDATION.md)，固定版本与校验实现不代表各架构已完成实机验证。
 
 ## helper 与授权
 
@@ -49,7 +49,15 @@ core 中的 `RouteGuard` 仅以 `add` 安装路由，不清空或替换系统路
 
 ## 本地配置与凭据
 
-配置目录由 `ProjectDirs` 决定；macOS 为 `~/Library/Application Support/tech.SSLRay.SSLRay/`。保存主密码的确认框会显示本机完整路径。
+配置目录由 `ProjectDirs` 决定，保存主密码的确认框会显示本机完整路径：
+
+| 系统 | 默认配置目录 |
+| --- | --- |
+| macOS | `~/Library/Application Support/tech.SSLRay.SSLRay/` |
+| Windows | `%APPDATA%\SSLRay\SSLRay\config\` |
+| Linux | `$XDG_CONFIG_HOME/sslray/`，未设置时为 `~/.config/sslray/` |
+
+源码目录、程序所在目录和管理员 helper 的身份不会改变这些用户配置路径；CLI 配置文件则由 `--profile` 明确指定。
 
 - `profiles.json`：多 Profile、稳定 ID、上次选择及可选的 `saved_password_base64`。Base64 可直接还原，不是加密；Unix 文件权限为 0600，Windows 依赖用户目录权限。取消保存并保存配置后移除主密码，复制 Profile 不复制密码；OTP 永不保存。旧版多配置的 `saved_password` 明文字段在下次保存时改为 Base64。
 - `ui-preferences.json`：语言 `zh-CN` / `en`、主题 `light` / `dark`，不含凭据。
@@ -58,6 +66,8 @@ core 中的 `RouteGuard` 仅以 `add` 安装路由，不清空或替换系统路
 旧配置 `use_server_routes: false` 在缺省、`gateway_only` 或 `merge` 策略下按 `manual_only` 处理。手动值仅在 `merge` / `manual_only` 下校验、应用。
 
 华为/Cisco 在申请管理员权限、发送凭据前进行仅含 TLS 的证书预检。自签名、私有 CA、过期或名称不匹配时可查看主体、签发者、有效期和 SHA-256，明确确认后继续。未勾选记住时，仅对本次连接副本固定该证书；勾选后保存当前 Profile 及 `certificate_sha256`，不额外启用密码保存，OTP 仍不保存。证书变化会拒绝连接，修改网关、端口、协议或加密模式会清空旧指纹；异步报告与确认均绑定当前 Profile/端点。坏签名、撤销或算法错误不提供继续选项。OpenVPN 仍遵循其配置中的 CA 与身份策略。
+
+静态 OpenSSL 不依赖构建机的证书路径：Linux 优先尊重显式 `SSL_CERT_FILE` / `SSL_CERT_DIR`，否则查找发行版标准 CA bundle；Windows 只读导入系统 ROOT，并过滤用途限制与 Disallowed。后者不是完整 Schannel 链策略或在线吊销实现。显式证书指纹保持独立，不会把一次确认写入系统信任库。
 
 主密码/OTP/会话密钥使用 `zeroize` 尽力清理，无法保证系统换页和库内部缓冲全部擦除。保存到本地的内容不上传云端，但需保护文件和备份。软件设置仅按本次会话的精确接口名查询，不显示其他适配器；未连接时不查询，最终断开确认后清空。Unix 使用 `getifaddrs` 和 MTU 查询，Windows 使用固定 PowerShell/.NET 查询（5 秒、1 MiB 上限）；异步结果校验会话代数，防止同名重连显示旧数据。查询失败仅显示本会话已知信息，并区分配置 MTU 与实测值。
 

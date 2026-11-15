@@ -14,6 +14,7 @@ use sslray_core::{config::Profile, crypto, legacy_native};
 use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
+    sync::mpsc,
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -273,4 +274,61 @@ fn malformed_short_cookie_and_denied_authentication_do_not_echo_secrets() {
         assert_redacted(&error);
         server.join().unwrap();
     }
+}
+
+#[test]
+fn short_negative_status_is_classified_after_a_bounded_read_without_replaying_login() {
+    let (release_tx, release_rx) = mpsc::channel();
+    let (profile, server) = fixture(move |acceptor, listener| {
+        let mut tls = accept(&acceptor, &listener);
+        primary_request(&mut tls);
+        let mut response = vec![0xf0; 4];
+        response.extend_from_slice(&(-5i32).to_be_bytes());
+        response.extend_from_slice(&[0, 0]);
+        tls.write_all(&response).unwrap();
+        // Hold TLS open until the bounded read has classified the short refusal.
+        // Trailing bytes must not turn that status into an I/O failure.
+        release_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        tls.get_ref()
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let mut byte = [0];
+        assert!(
+            matches!(
+                tls.read(&mut byte),
+                Err(error) if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                )
+            ),
+            "Authentication refusal sent additional application data"
+        );
+        assert!(
+            matches!(
+                listener.accept(),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+            ),
+            "Authentication refusal opened a second connection"
+        );
+    });
+    let mut tls = crypto::connect(&profile).unwrap();
+    let start = Instant::now();
+    let result = legacy_native::authenticate_on(&profile, &mut tls, PASSWORD, no_challenge);
+    let elapsed = start.elapsed();
+    release_tx.send(()).unwrap();
+    server.join().unwrap();
+    let error = result
+        .err()
+        .expect("Negative native status must be refused");
+    assert!(
+        error
+            .to_string()
+            .contains("rejected authentication (status -5)")
+    );
+    assert!(error.to_string().contains("no automatic retry"));
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "Short refusal exceeded the bounded authentication read"
+    );
+    assert_redacted(&error);
 }

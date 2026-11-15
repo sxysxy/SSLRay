@@ -66,6 +66,9 @@ fn test_identity_with_crypto(gm: bool) -> (SslAcceptor, String) {
     let cert = cert.build();
     let pin = hex::encode(cert.digest(MessageDigest::sha256()).unwrap());
     let mut acceptor = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls_server()).unwrap();
+    // Wrong-pin clients close immediately after TLS. Keep post-handshake
+    // session-ticket writes from racing that expected close on Windows.
+    acceptor.set_num_tickets(0).unwrap();
     acceptor.set_private_key(&key).unwrap();
     acceptor.set_certificate(&cert).unwrap();
     acceptor.check_private_key().unwrap();

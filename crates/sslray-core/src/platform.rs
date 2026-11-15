@@ -110,17 +110,9 @@ impl Tunnel {
         }
         #[cfg(target_os = "windows")]
         {
-            // Never search CWD/PATH for a privileged process's DLL dependency.
-            let dll = std::env::current_exe()?
-                .parent()
-                .context("Missing executable directory")?
-                .join("wintun.dll");
-            ensure!(
-                dll.is_file(),
-                "Place the signed, matching-architecture wintun.dll beside SSLRay"
-            );
-            // SAFETY: the explicit executable-relative path avoids DLL search path hijacking.
-            let wintun = unsafe { wintun_bindings::load_from_path(&dll) }
+            // Authenticate and lock official bytes before any DLL code executes.
+            // The binding's load_from_path verifies only after an initial load.
+            let wintun = crate::windows_wintun::load()
                 .context("Loading Wintun from the application directory")?;
             // A new adapter per helper process avoids taking ownership of an existing VPN.
             let name = format!("SSLRay-{}", std::process::id());
@@ -383,7 +375,7 @@ fn full_route_plan(interface: &str, snapshots: &[PeerRoute]) -> Result<Vec<Route
 }
 
 fn read_command(spec: &CommandSpec) -> Result<String> {
-    let output = Command::new(&spec.program)
+    let output = background_command(&spec.program)
         .args(&spec.args)
         .stdin(Stdio::null())
         .output()
@@ -643,7 +635,7 @@ fn peer_pin_commands(_: &PeerRoute) -> RouteCommands {
 }
 
 fn run_command(spec: &CommandSpec) -> Result<()> {
-    let output = Command::new(&spec.program)
+    let output = background_command(&spec.program)
         .args(&spec.args)
         .stdin(Stdio::null())
         .output()
@@ -656,6 +648,19 @@ fn run_command(spec: &CommandSpec) -> Result<()> {
         String::from_utf8_lossy(&output.stderr).trim()
     );
     Ok(())
+}
+
+fn background_command(program: &str) -> Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let mut command = Command::new(program);
+        // Hide netsh/PowerShell consoles, not the operating system's UAC consent.
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        command
+    }
+    #[cfg(not(windows))]
+    Command::new(program)
 }
 fn execute_transaction(
     plans: &[RouteCommands],
@@ -894,7 +899,7 @@ fn run_elevated(
         let script = format!(
             "$ErrorActionPreference='Stop'; $p=Start-Process -FilePath '{path}' -ArgumentList '{args}' -Verb RunAs -PassThru -Wait; exit $p.ExitCode"
         );
-        let mut c = Command::new(windows_system_binary(
+        let mut c = background_command(&windows_system_binary(
             "WindowsPowerShell/v1.0/powershell.exe",
         ));
         c.args(["-NoProfile", "-NonInteractive", "-Command", &script]);

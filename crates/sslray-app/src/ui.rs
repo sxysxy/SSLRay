@@ -2925,7 +2925,7 @@ fn log_list_card(
             .id_salt("session-log-list")
             .stick_to_bottom(true)
             .max_height(max_height)
-            .min_scrolled_height(0.0)
+            .min_scrolled_height(max_height)
             .auto_shrink([false, true])
             .show(ui, |ui| {
                 ui.set_max_width(ui.available_width());

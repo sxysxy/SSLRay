@@ -3583,6 +3583,7 @@ dependencies = [
  "bytes",
  "hex",
  "libc",
+ "libloading 0.9.1",
  "objc2 0.6.4",
  "openssl",
  "roxmltree",
@@ -3595,6 +3596,7 @@ dependencies = [
  "tun",
  "vpn-core",
  "vpn-openvpn",
+ "windows-sys 0.61.2",
  "wintun-bindings",
  "zeroize",
 ]

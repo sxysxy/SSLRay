@@ -4,14 +4,13 @@
 use crate::{
     backend::{BackendConnection, PacketBackend},
     config::{CryptoMode, Profile, TransportMode, VpnProtocol},
-    crypto,
+    crypto::{self, TlsStream},
 };
 use anyhow::{Context, Result, bail, ensure};
-use openssl::ssl::SslStream;
 use sha2::{Digest, Sha256};
 use std::{
     io::{self, Read, Write},
-    net::{Ipv4Addr, TcpStream},
+    net::Ipv4Addr,
     time::{Duration, Instant},
 };
 use zeroize::{Zeroize, Zeroizing};
@@ -114,11 +113,7 @@ fn write_frame(stream: &mut impl Write, command: u8, payload: &[u8]) -> Result<(
     stream.flush()?;
     Ok(())
 }
-fn receive(
-    stream: &mut SslStream<TcpStream>,
-    decoder: &mut Decoder,
-    expected: u8,
-) -> Result<Frame> {
+fn receive(stream: &mut TlsStream, decoder: &mut Decoder, expected: u8) -> Result<Frame> {
     let frame = decoder
         .read(stream)?
         .context("Gateway handshake timed out")?;
@@ -134,7 +129,7 @@ enum FirstReply {
     V1,
     Legacy(Zeroizing<Vec<u8>>),
 }
-fn receive_first(stream: &mut SslStream<TcpStream>) -> Result<FirstReply> {
+fn receive_first(stream: &mut TlsStream) -> Result<FirstReply> {
     let mut first = [0; 8];
     stream.read_exact(&mut first)?;
     if first[..4] == MAGIC {
@@ -267,7 +262,7 @@ fn sms_payload(otp: &str) -> Result<Zeroizing<Vec<u8>>> {
 }
 
 fn switch_transport(
-    stream: &mut SslStream<TcpStream>,
+    stream: &mut TlsStream,
     decoder: &mut Decoder,
     token: &[u8],
     mode: u8,
@@ -293,7 +288,7 @@ pub struct Gateway {
     pub transport: String,
     pub negotiated_mtu: Option<u16>,
     data: DataChannel,
-    control: Option<SslStream<TcpStream>>,
+    control: Option<TlsStream>,
     control_decoder: Decoder,
     token: Zeroizing<Vec<u8>>,
     started: Instant,
@@ -302,10 +297,7 @@ pub struct Gateway {
     last_data_keepalive: Instant,
 }
 enum DataChannel {
-    Tls {
-        stream: SslStream<TcpStream>,
-        decoder: Decoder,
-    },
+    Tls { stream: TlsStream, decoder: Decoder },
     Udp(udp::UdpChannel),
     Legacy(Box<legacy::LegacyChannel>),
     External(Box<dyn PacketBackend>),
