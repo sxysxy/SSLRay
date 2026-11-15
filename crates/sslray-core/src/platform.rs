@@ -13,6 +13,10 @@ use std::{
 #[cfg(unix)]
 use tun::AbstractDevice;
 
+#[cfg(target_os = "macos")]
+#[path = "macos_authorization.rs"]
+mod macos_authorization;
+
 /// A normalized IPv4 split route. The default route is deliberately excluded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Ipv4Route {
@@ -776,6 +780,14 @@ impl Drop for RouteGuard {
     }
 }
 
+/// Select whether macOS may use the host's existing Touch ID sudo policy.
+/// Password always requests the normal system administrator dialog.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ElevationMethod {
+    Automatic,
+    Password,
+}
+
 /// Launch the same executable with a native administrator prompt. This waits for
 /// the privileged helper to exit; call from a launcher thread beside the IPC server.
 /// The token authenticates the one-shot local IPC channel; VPN secrets are not args.
@@ -793,6 +805,7 @@ pub fn request_elevation(executable: &Path, port: u16, token: &str) -> Result<()
             "--token".into(),
             token.into(),
         ],
+        ElevationMethod::Automatic,
     )
 }
 
@@ -800,6 +813,18 @@ pub fn request_elevation(executable: &Path, port: u16, token: &str) -> Result<()
 /// checks the accepted peer's UID before transmitting any VPN credentials.
 #[cfg(unix)]
 pub fn request_elevation_socket(executable: &Path, socket: &Path, token: &str) -> Result<()> {
+    request_elevation_socket_with_method(executable, socket, token, ElevationMethod::Automatic)
+}
+
+/// A failed biometric attempt is terminal for this request. A password retry
+/// must be an explicit new request, so an already-started helper is never relaunched.
+#[cfg(unix)]
+pub fn request_elevation_socket_with_method(
+    executable: &Path,
+    socket: &Path,
+    token: &str,
+    method: ElevationMethod,
+) -> Result<()> {
     use std::os::unix::fs::FileTypeExt;
     ensure!(socket.is_absolute(), "Helper socket path must be absolute");
     ensure!(
@@ -818,6 +843,7 @@ pub fn request_elevation_socket(executable: &Path, socket: &Path, token: &str) -
             "--token".into(),
             token.into(),
         ],
+        method,
     )
 }
 
@@ -829,20 +855,20 @@ fn validate_helper_token(token: &str) -> Result<()> {
     Ok(())
 }
 
-fn run_elevated(executable: &Path, arguments: &[std::ffi::OsString]) -> Result<()> {
+fn run_elevated(
+    executable: &Path,
+    arguments: &[std::ffi::OsString],
+    method: ElevationMethod,
+) -> Result<()> {
     let executable = executable
         .canonicalize()
         .context("Resolving helper executable")?;
     ensure!(executable.is_file(), "Helper executable is missing");
     #[cfg(target_os = "macos")]
-    let mut command = {
-        // Values travel as argv and AppleScript's native quoted form. No value is
-        // interpolated into AppleScript source or an unquoted shell fragment.
-        let script = "on run argv\nset shellCommand to quoted form of item 1 of argv\nrepeat with i from 2 to count of argv\nset shellCommand to shellCommand & \" \" & (quoted form of item i of argv)\nend repeat\ndo shell script shellCommand with administrator privileges\nend run";
-        let mut c = Command::new("/usr/bin/osascript");
-        c.arg("-e").arg(script).arg(executable).args(arguments);
-        c
-    };
+    let (mut command, biometric) =
+        macos_authorization::launch_command(&executable, arguments, method);
+    #[cfg(not(target_os = "macos"))]
+    let _ = method;
     #[cfg(target_os = "linux")]
     let mut command = {
         let pkexec = ["/usr/bin/pkexec", "/bin/pkexec"]
@@ -881,10 +907,24 @@ fn run_elevated(executable: &Path, arguments: &[std::ffi::OsString]) -> Result<(
     }
     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     {
-        let output = command
-            .stdin(Stdio::null())
-            .output()
-            .context("Starting administrator authorization")?;
+        let output = command.stdin(Stdio::null()).output();
+        #[cfg(target_os = "macos")]
+        if biometric && !output.as_ref().is_ok_and(|output| output.status.success()) {
+            // sudo's exit status cannot reliably distinguish a rejected prompt
+            // from an error after the helper started. Never retry automatically.
+            match output {
+                Ok(output) => bail!(
+                    "Administrator biometric authorization not completed ({}): {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr).trim(),
+                ),
+                Err(error) => {
+                    return Err(error)
+                        .context("Administrator biometric authorization not completed");
+                }
+            }
+        }
+        let output = output.context("Starting administrator authorization")?;
         if !output.status.success() {
             bail!(
                 "Administrator authorization/helper failed ({}): {}",

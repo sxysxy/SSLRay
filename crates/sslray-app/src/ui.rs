@@ -692,15 +692,19 @@ impl App {
             });
         });
         if cancel || response.should_close() {
-            self.password_dialog = false;
-            self.password.zeroize();
-            self.show_password = false;
-            self.certificate_approval = None;
+            self.cancel_password_dialog();
         } else if submit {
             self.password_dialog = false;
             self.show_password = false;
             self.connect();
         }
+    }
+
+    fn cancel_password_dialog(&mut self) {
+        self.password_dialog = false;
+        self.password.zeroize();
+        self.show_password = false;
+        self.clear_certificate_check();
     }
 
     fn busy(&self) -> bool {
@@ -959,6 +963,18 @@ impl App {
     }
 
     fn connect(&mut self) {
+        self.connect_attempt();
+        #[cfg(target_os = "macos")]
+        if !self.busy()
+            && !self.password_dialog
+            && self.certificate_query.is_none()
+            && self.certificate_review.is_none()
+        {
+            self.controller.clear_authorization_preference();
+        }
+    }
+
+    fn connect_attempt(&mut self) {
         if self.busy() || self.certificate_query.is_some() || self.certificate_review.is_some() {
             return;
         }
@@ -1073,6 +1089,8 @@ impl App {
         self.certificate_query = None;
         self.certificate_review = None;
         self.certificate_approval = None;
+        #[cfg(target_os = "macos")]
+        self.controller.clear_authorization_preference();
     }
 
     fn start_certificate_check(&mut self) {
@@ -1117,6 +1135,7 @@ impl App {
             }
         };
         let Some(query) = self.certificate_query.take() else {
+            self.clear_certificate_check();
             self.notice = Some(Notice::plain(T::CertificateCheckFailed));
             return;
         };
@@ -1137,6 +1156,7 @@ impl App {
                 self.show(ctx);
             }
             Err(error) => {
+                self.clear_certificate_check();
                 self.notice = Some(Notice::error(T::CertificateCheckFailed, error));
                 self.show(ctx);
             }
@@ -1188,6 +1208,7 @@ impl App {
             );
             if let Some(choice) = choice {
                 let Some(review) = self.certificate_review.take() else {
+                    self.clear_certificate_check();
                     self.notice = Some(Notice::plain(T::CertificateDecisionFailed));
                     return;
                 };
@@ -1198,12 +1219,12 @@ impl App {
                     match self.approve_certificate(&review) {
                         Ok(()) => self.connect(),
                         Err(error) => {
-                            self.certificate_approval = None;
+                            self.clear_certificate_check();
                             self.notice = Some(Notice::error(T::CertificateDecisionFailed, error));
                         }
                     }
                 } else {
-                    self.certificate_approval = None;
+                    self.clear_certificate_check();
                 }
             }
         }
@@ -1311,7 +1332,10 @@ impl App {
         let colors = palette(ui);
         self.profile_selector(ui, false);
         let lang = self.language;
-        if self.authorization_retry && !self.busy() {
+        if (self.authorization_retry
+            || (cfg!(target_os = "macos") && self.controller.snapshot().authorization_failed))
+            && !self.busy()
+        {
             card(ui).show(ui, |ui| {
                 ui.label(
                     RichText::new(text(lang, T::AuthorizationFailed))
@@ -1320,9 +1344,16 @@ impl App {
                 );
                 ui.label(text(lang, T::AuthorizationRetryHelp));
                 ui.label(text(lang, self.authorization_help()));
-                if ui.button(text(lang, T::RetryAuthorization)).clicked() {
-                    self.connect();
-                }
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button(text(lang, T::RetryAuthorization)).clicked() {
+                        self.connect();
+                    }
+                    #[cfg(target_os = "macos")]
+                    if ui.button(text(lang, T::AuthorizeWithPassword)).clicked() {
+                        self.controller.prefer_password_authorization_once();
+                        self.connect();
+                    }
+                });
             });
             ui.add_space(16.0);
         }
@@ -3309,6 +3340,55 @@ mod tests {
         assert!(app.password_dialog);
         assert!(!app.controller.is_busy());
         assert!(!app.config_dir.as_ref().unwrap().exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn password_authorization_choice_lasts_only_for_the_pending_connection_flow() {
+        use sslray_core::platform::ElevationMethod;
+        let mut fixture = TestApp::new();
+        let app = &mut fixture.0;
+
+        app.controller.prefer_password_authorization_once();
+        app.connect(); // Missing username: local validation, no network.
+        assert_eq!(
+            app.controller.pending_elevation_method(),
+            ElevationMethod::Automatic
+        );
+        assert!(!app.busy() && app.certificate_query.is_none());
+
+        app.profile.username = "synthetic-user".into();
+        app.controller.prefer_password_authorization_once();
+        app.connect(); // A genuine pending password dialog retains the choice.
+        assert!(app.password_dialog);
+        assert_eq!(
+            app.controller.pending_elevation_method(),
+            ElevationMethod::Password
+        );
+        assert!(!app.busy() && app.certificate_query.is_none());
+        app.cancel_password_dialog(); // The same handler used by Cancel / Escape.
+        assert!(!app.password_dialog);
+        assert_eq!(
+            app.controller.pending_elevation_method(),
+            ElevationMethod::Automatic
+        );
+
+        app.controller.prefer_password_authorization_once();
+        app.clear_certificate_check();
+        assert_eq!(
+            app.controller.pending_elevation_method(),
+            ElevationMethod::Automatic
+        );
+
+        let previous_profile = app.profiles.selected_id;
+        app.controller.prefer_password_authorization_once();
+        app.perform_profile_action(ProfileAction::New);
+        assert_ne!(app.profiles.selected_id, previous_profile);
+        assert_eq!(
+            app.controller.pending_elevation_method(),
+            ElevationMethod::Automatic
+        );
+        assert!(!app.busy());
     }
 
     fn simulated_certificate_report(trusted: bool) -> CertificateReport {

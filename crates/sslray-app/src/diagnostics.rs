@@ -24,6 +24,7 @@ pub enum DiagnosticKind {
     OtpRejected,
     OtpRequired,
     AdministratorAuthorization,
+    BiometricAuthorization,
     HelperCommunication,
     Cancelled,
     Timeout,
@@ -96,6 +97,27 @@ fn classify_with_depth(message: &str, depth: u8) -> DiagnosticKind {
             | "OpenVPN authentication cancelled"
     ) {
         return K::Cancelled;
+    }
+    let mut authorization_detail = message;
+    for _ in 0..4 {
+        if let Some(detail) =
+            authorization_detail.strip_prefix("Administrator authorization failed: ")
+        {
+            authorization_detail = detail;
+        } else {
+            break;
+        }
+    }
+    if authorization_detail == "Administrator biometric authorization not completed"
+        || starts_with_any(
+            authorization_detail,
+            &[
+                "Administrator biometric authorization not completed (",
+                "Administrator biometric authorization not completed: ",
+            ],
+        )
+    {
+        return K::BiometricAuthorization;
     }
     // Prefixes below are emitted by our helper startup code. A timeout while
     // communicating with a helper is not a failed administrator password.
@@ -557,6 +579,10 @@ fn summary(language: Language, kind: DiagnosticKind) -> &'static str {
             "系统授权或网络助手启动未完成，请查看系统提示后重试。",
             "Administrator authorization or helper startup did not complete. Check the system prompt and try again.",
         ),
+        K::BiometricAuthorization => (
+            "指纹授权未完成。可以重试，或选择“使用密码授权”。",
+            "Touch ID authorization did not complete. Retry or choose Authorize with password.",
+        ),
         K::HelperCommunication => (
             "无法与网络助手通信，请重试连接并查看技术详情。",
             "Could not communicate with the network helper. Retry the connection and check technical details.",
@@ -615,6 +641,31 @@ fn summary(language: Language, kind: DiagnosticKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn biometric_errors_are_localized_without_claiming_wrong_password() {
+        for raw in [
+            "Administrator biometric authorization not completed",
+            "Administrator biometric authorization not completed (exit status: 1): sudo failed",
+            "Administrator authorization failed: Administrator authorization failed: Administrator biometric authorization not completed: access denied",
+        ] {
+            for language in [Language::ZhCn, Language::En] {
+                let diagnostic = describe(language, raw);
+                assert_eq!(diagnostic.kind, DiagnosticKind::BiometricAuthorization);
+                assert_eq!(diagnostic.technical_detail, Some(raw));
+                assert!(!diagnostic.summary.contains("wrong password"));
+                assert!(!diagnostic.summary.contains("密码错误"));
+            }
+        }
+        assert_eq!(
+            describe(
+                Language::En,
+                "server says Administrator biometric authorization not completed"
+            )
+            .kind,
+            DiagnosticKind::Unknown,
+        );
+    }
 
     #[test]
     fn tls_parameter_alert_has_a_short_localized_summary_and_intact_details() {

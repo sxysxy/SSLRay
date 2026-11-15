@@ -6,7 +6,7 @@
 
 | 系统 | 虚拟网卡 / 路由 | 系统授权 | 额外依赖 |
 | --- | --- | --- | --- |
-| macOS | 动态编号 `utunN` / `/sbin/route` | 管理员授权弹窗 | Xcode 命令行工具、Perl、make、Python 3.11+ |
+| macOS | 动态编号 `utunN` / `/sbin/route` | 条件优先 Touch ID，系统管理员弹窗备用 | Xcode 命令行工具、Perl、make、Python 3.11+ |
 | Linux | `/dev/net/tun` / iproute2 | polkit `pkexec` | iproute2、polkit 及桌面认证代理；GUI 依赖见下方 |
 | Windows | Wintun / `netsh store=active` | UAC `RunAs` | MSVC、OpenSSL（如 vcpkg）、匹配架构的签名 `wintun.dll` |
 
@@ -21,6 +21,10 @@ Linux 托盘需桌面支持 AppIndicator。Windows 的 `wintun.dll` 从[官方](
 ## helper 与授权
 
 GUI 以普通权限运行；首次连接启动同一程序的 `--helper` 子进程。macOS/Linux 使用 0700 临时目录内的 Unix socket，发送凭据前核对 root 对端；Windows 使用本机 TCP、随机令牌和内核进程身份检查，双方核对程序与原 GUI PID。凭据不出现在命令行，管理员密码由系统处理。
+
+macOS 仅在系统 sudo PAM 已启用 `pam_tid`、LocalAuthentication 的无弹窗可用性检查通过时优先尝试 Touch ID；不修改 PAM 或授权数据库。仅识别 sudo 或其 sudo_local 中先于其它认证模块的标准 `auth sufficient pam_tid.so` 配置；复杂策略沿用系统密码。实际授权仍受桌面会话、账户及 sudo 策略约束。指纹路径直接执行 `sudo -k -S -p '' -- <helper> ...`，stdin 固定为 `/dev/null`，应用不接收或传递管理员密码；不使用 askpass。带命令的 `-k` 忽略且不更新 sudo 认证缓存，不清空其他会话的 sudo 票据。机制见 [Apple pam_tid](https://github.com/apple-oss-distributions/pam_modules/blob/main/modules/pam_tid/pam_tid.c) 和 [sudo 手册](https://github.com/sudo-project/sudo/blob/main/docs/sudo.man.in)。
+
+指纹不可用时使用原系统管理员弹窗；一旦开始指纹尝试，取消、失败或超时均不会自动再弹密码框。用户可通过显式按钮重试或选择系统密码授权；helper 已启动后的握手、通信或会话错误也不会自动触发第二次提权。下述 helper 复用期限不因授权方式改变。真实生物识别及系统密码提权仍待实测，见[验证状态](VALIDATION.md)。
 
 监听端非阻塞，已接入通道显式恢复阻塞并设置读取时间片；握手按总期限等待分片，可响应取消。这样避免 macOS 将暂时没有握手数据的 `EAGAIN` 误报为授权失败；对端身份、nonce 和就绪探测均通过后才发送 VPN 凭据。
 

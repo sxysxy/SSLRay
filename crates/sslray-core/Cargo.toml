@@ -22,6 +22,9 @@ tokio-util = { version = "0.7", features = ["rt"] }
 bytes = "1"
 async-trait = "0.1"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"
+
 [target.'cfg(target_os = "windows")'.dependencies]
 wintun-bindings = { version = "0.7.40", features = ["verify_binary_signature"] }
 

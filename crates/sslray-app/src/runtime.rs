@@ -222,6 +222,7 @@ pub struct Controller {
     cancel: Arc<AtomicBool>,
     otp_sender: Option<mpsc::Sender<Zeroizing<String>>>,
     authority: Arc<Authority>,
+    elevation_method: platform::ElevationMethod,
 }
 impl Controller {
     pub fn new() -> Self {
@@ -232,6 +233,7 @@ impl Controller {
             cancel: Arc::new(AtomicBool::new(false)),
             otp_sender: None,
             authority: Arc::new(Authority::default()),
+            elevation_method: platform::ElevationMethod::Automatic,
         }
     }
     pub fn snapshot(&self) -> &Snapshot {
@@ -240,16 +242,34 @@ impl Controller {
     pub fn is_busy(&self) -> bool {
         self.events.is_some()
     }
+    /// A user explicitly chose the system password dialog for the next attempt.
+    /// This never changes the system's authentication policy or saved settings.
+    #[cfg(target_os = "macos")]
+    pub fn prefer_password_authorization_once(&mut self) {
+        if !self.is_busy() && !self.authority.closed.load(Ordering::Relaxed) {
+            self.elevation_method = platform::ElevationMethod::Password;
+        }
+    }
+    #[cfg(target_os = "macos")]
+    pub fn clear_authorization_preference(&mut self) {
+        self.elevation_method = platform::ElevationMethod::Automatic;
+    }
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn pending_elevation_method(&self) -> platform::ElevationMethod {
+        self.elevation_method
+    }
     /// End app-scoped authorization as well as the active VPN session.
     pub fn shutdown(&mut self) {
         self.disconnect();
         self.authority.shutdown();
+        self.elevation_method = platform::ElevationMethod::Automatic;
     }
     /// Clear the previous profile's metrics without discarding its reusable helper.
     pub fn reset_snapshot(&mut self) -> bool {
         if self.events.is_some() {
             return false;
         }
+        self.elevation_method = platform::ElevationMethod::Automatic;
         self.snapshot = Snapshot {
             session_generation: self.session_generation,
             ..Snapshot::default()
@@ -271,6 +291,12 @@ impl Controller {
         ensure!(
             self.events.is_none(),
             "A VPN operation is already in progress"
+        );
+        // Consume the choice even if this attempt fails local validation. A
+        // later unrelated connection returns to automatic authentication.
+        let elevation_method = std::mem::replace(
+            &mut self.elevation_method,
+            platform::ElevationMethod::Automatic,
         );
         // A fresh user-initiated attempt must not retain an earlier failure's
         // retry guidance if file preparation or preflight validation fails.
@@ -295,7 +321,7 @@ impl Controller {
         self.events = Some(rx);
         let authority = self.authority.clone();
         thread::spawn(move || {
-            let result = run_client(request, cancel, otp_rx, &authority, |e| {
+            let result = run_client(request, cancel, otp_rx, &authority, elevation_method, |e| {
                 let _ = tx.send(e);
             });
             if let Err(e) = result {
@@ -595,6 +621,7 @@ fn is_authorization_failed(message: &str) -> bool {
         || message == "Administrator authorization cancelled"
         || message == "Helper requires administrator privileges"
         || message.starts_with("Administrator authorization/helper failed (")
+        || message.starts_with("Administrator biometric authorization not completed")
 }
 
 fn wait_otp(
@@ -620,6 +647,7 @@ fn run_client(
     cancel: Arc<AtomicBool>,
     otp_rx: Receiver<Zeroizing<String>>,
     authority: &Authority,
+    elevation_method: platform::ElevationMethod,
     mut emit: impl FnMut(Event),
 ) -> Result<()> {
     if platform::is_admin() {
@@ -662,7 +690,8 @@ fn run_client(
         });
         // This prefix is scoped to privilege acquisition only. Gateway
         // authentication and later network/IPC failures remain distinct.
-        let mut helper = launch_helper(&cancel).context("Administrator authorization failed")?;
+        let mut helper = launch_helper(&cancel, elevation_method)
+            .context("Administrator authorization failed")?;
         helper
             .probe(&cancel)
             .context("Administrator authorization failed")?;
@@ -687,7 +716,10 @@ fn run_client(
     result
 }
 
-fn launch_helper(cancel: &AtomicBool) -> Result<HelperChannel> {
+fn launch_helper(
+    cancel: &AtomicBool,
+    elevation_method: platform::ElevationMethod,
+) -> Result<HelperChannel> {
     let mut nonce = [0u8; 32];
     getrandom::fill(&mut nonce).map_err(|e| anyhow::anyhow!("Creating helper nonce: {e}"))?;
     let token = hex::encode(nonce);
@@ -711,9 +743,16 @@ fn launch_helper(cancel: &AtomicBool) -> Result<HelperChannel> {
     let (elev_tx, elev_rx) = mpsc::channel();
     thread::spawn(move || {
         #[cfg(unix)]
-        let result = platform::request_elevation_socket(&executable, &endpoint, &token);
+        let result = platform::request_elevation_socket_with_method(
+            &executable,
+            &endpoint,
+            &token,
+            elevation_method,
+        );
         #[cfg(windows)]
         let result = platform::request_elevation(&executable, port, &token);
+        #[cfg(windows)]
+        let _ = elevation_method;
         let _ = elev_tx.send(result);
     });
     let deadline = Instant::now() + Duration::from_secs(120);
@@ -1082,6 +1121,7 @@ pub fn foreground(
         cancel,
         otp_rx,
         &authority,
+        platform::ElevationMethod::Automatic,
         |event| {
             if let Event::Challenge { .. } = &event {
                 let sender = otp_tx.clone();
@@ -1148,6 +1188,8 @@ mod tests {
             "Administrator authorization failed: Install polkit/pkexec to request administrator privileges",
             "Administrator authorization failed: Administrator authorization/helper failed (exit status: 1): user cancelled",
             "Administrator authorization failed: Reading privileged helper greeting: Privileged helper response timed out",
+            "Administrator authorization failed: Administrator biometric authorization not completed (exit status: 1)",
+            "Administrator biometric authorization not completed: authentication unavailable",
             "Administrator authorization timed out",
             "Helper requires administrator privileges",
         ] {
@@ -1189,6 +1231,40 @@ mod tests {
         assert!(controller.connect(profile, String::new(), None).is_err());
         assert!(!controller.snapshot.authorization_failed);
         assert!(!controller.is_busy());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn password_authorization_choice_is_single_attempt_and_cannot_override_active_work() {
+        let mut controller = Controller::new();
+        controller.prefer_password_authorization_once();
+        assert_eq!(
+            controller.elevation_method,
+            platform::ElevationMethod::Password
+        );
+        let invalid = Profile {
+            host: String::new(),
+            ..Profile::default()
+        };
+        assert!(controller.connect(invalid, String::new(), None).is_err());
+        assert_eq!(
+            controller.elevation_method,
+            platform::ElevationMethod::Automatic
+        );
+        let (_tx, rx) = mpsc::channel();
+        controller.events = Some(rx);
+        controller.prefer_password_authorization_once();
+        assert_eq!(
+            controller.elevation_method,
+            platform::ElevationMethod::Automatic
+        );
+        controller.events = None;
+        controller.shutdown();
+        controller.prefer_password_authorization_once();
+        assert_eq!(
+            controller.elevation_method,
+            platform::ElevationMethod::Automatic
+        );
     }
 
     #[test]
