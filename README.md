@@ -2,9 +2,11 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-A Rust SSL VPN desktop client with an egui interface, named profiles, a system tray, background operation, Chinese/English localization, and light/dark themes. See the [platform validation record](docs/VALIDATION.md) for the tested scope of version 0.1.0.
+A Rust SSL VPN desktop client with an egui interface, named profiles, a system tray, background operation, Chinese/English localization, and light/dark themes. See the [platform validation record](docs/VALIDATION.md) for current verification status and historical acceptance scope.
 
 Licensed under **GPL-3.0-or-later** with the [Wintun linking permission](LICENSE-WINTUN-EXCEPTION). See [LICENSE](LICENSE), [COPYRIGHT](COPYRIGHT), and the [third-party notices](docs/THIRD-PARTY.md).
+
+**0.2.0 changes:** The tray follows background disconnections: green when connected, the original blue when disconnected, amber while connecting, waiting for a second password or disconnecting, and red on failure. Tooltips follow the selected language, and **Disconnect** is enabled only while connected. All three platforms build and pass regression tests; see the validation record for runtime scope.
 
 | Protocol | Implementation | Validated environment |
 | --- | --- | --- |

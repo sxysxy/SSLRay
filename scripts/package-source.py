@@ -36,6 +36,10 @@ def digest(path):
         return hashlib.file_digest(file, "sha256").hexdigest()
 
 
+def workspace_version():
+    return tomllib.loads((ROOT / "Cargo.toml").read_text())["workspace"]["package"]["version"]
+
+
 def command(arguments, cwd=ROOT):
     result = subprocess.run(arguments, cwd=cwd, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, check=True)
@@ -322,7 +326,7 @@ def verify_tree(tree):
 
 
 def prepare(stage, openssl_archive, patterns, vendor_home=None):
-    version = tomllib.loads((ROOT / "Cargo.toml").read_text())["workspace"]["package"]["version"]
+    version = workspace_version()
     tree = stage / "SSLRay"
     if stage.is_symlink() or not stage.resolve().is_relative_to((ROOT / "work").resolve()):
         raise ValueError("Generated staging directory must be inside this project's work/")
@@ -449,7 +453,7 @@ def make_archive(tree, archive, epoch):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--stage", type=Path, default=ROOT / "work/source-release-0.1.0")
+    parser.add_argument("--stage", type=Path, default=ROOT / "work" / f"source-release-{workspace_version()}")
     parser.add_argument("--openssl-checkout", type=Path, required=True)
     parser.add_argument("--scan-stdin", action="store_true", help="Read a JSON array of forbidden texts only from stdin; never store those texts")
     parser.add_argument("--vendor-cargo-home", type=Path, help="Isolated checksum-verified public Cargo cache for offline vendoring into the generated export only")

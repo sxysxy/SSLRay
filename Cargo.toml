@@ -4,7 +4,7 @@ exclude = ["third_party/omnitun/crates/vpn-core", "third_party/omnitun/crates/vp
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
 rust-version = "1.95"

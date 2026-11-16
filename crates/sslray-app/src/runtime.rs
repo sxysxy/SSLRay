@@ -242,6 +242,23 @@ impl Controller {
     pub fn is_busy(&self) -> bool {
         self.events.is_some()
     }
+    /// Drive the real event reducer in headless tests without a worker, network
+    /// connection, credentials or administrator authorization.
+    #[cfg(test)]
+    pub(crate) fn attach_test_session(&mut self) -> mpsc::Sender<Event> {
+        assert!(!self.is_busy(), "Test session is already active");
+        let (sender, receiver) = mpsc::channel();
+        self.events = Some(receiver);
+        self.cancel = Arc::new(AtomicBool::new(false));
+        self.otp_sender = None;
+        self.snapshot = Snapshot {
+            session_generation: self.session_generation,
+            state: ConnectionState::Connecting,
+            message: "Waiting for administrator authorization".into(),
+            ..Snapshot::default()
+        };
+        sender
+    }
     /// A user explicitly chose the system password dialog for the next attempt.
     /// This never changes the system's authentication policy or saved settings.
     #[cfg(target_os = "macos")]
@@ -356,8 +373,13 @@ impl Controller {
     pub fn disconnect(&mut self) {
         if self.events.is_some() {
             self.cancel.store(true, Ordering::Relaxed);
-            self.snapshot.state = ConnectionState::Disconnecting;
-            self.snapshot.message = "Disconnecting and removing split routes".into();
+            self.snapshot.challenge = None;
+            // A queued click or shutdown must not erase a real failure while
+            // the worker is still finishing route/interface cleanup.
+            if self.snapshot.state != ConnectionState::Failed {
+                self.snapshot.state = ConnectionState::Disconnecting;
+                self.snapshot.message = "Disconnecting and removing split routes".into();
+            }
         }
     }
     pub fn poll(&mut self) {
@@ -370,7 +392,11 @@ impl Controller {
         for event in events {
             match event {
                 Event::Status { message } => {
-                    self.snapshot.message = message.clone();
+                    if !self.cancel.load(Ordering::Relaxed)
+                        && self.snapshot.state != ConnectionState::Failed
+                    {
+                        self.snapshot.message = message.clone();
+                    }
                     self.snapshot.logs.push(message);
                 }
                 Event::Connected {
@@ -379,14 +405,20 @@ impl Controller {
                     cipher,
                     transport,
                 } => {
-                    self.session_generation = self.session_generation.saturating_add(1);
-                    self.snapshot.session_generation = self.session_generation;
-                    self.snapshot.state = ConnectionState::Connected;
-                    self.snapshot.interface = Some(interface);
-                    self.snapshot.address = Some(address);
-                    self.snapshot.cipher = Some(cipher);
-                    self.snapshot.message = format!("Connected over {transport}");
-                    self.snapshot.transport = Some(transport);
+                    if self.snapshot.state != ConnectionState::Failed {
+                        self.session_generation = self.session_generation.saturating_add(1);
+                        self.snapshot.session_generation = self.session_generation;
+                        // Retain interface ownership for cleanup display, but a
+                        // late handshake event cannot revive a cancelled session.
+                        self.snapshot.interface = Some(interface);
+                        self.snapshot.address = Some(address);
+                        self.snapshot.cipher = Some(cipher);
+                        self.snapshot.transport = Some(transport.clone());
+                        if !self.cancel.load(Ordering::Relaxed) {
+                            self.snapshot.state = ConnectionState::Connected;
+                            self.snapshot.message = format!("Connected over {transport}");
+                        }
+                    }
                 }
                 Event::Routes {
                     advertised_routes,
@@ -396,9 +428,13 @@ impl Controller {
                     self.snapshot.applied_routes = applied_routes;
                 }
                 Event::Challenge { method } => {
-                    self.snapshot.state = ConnectionState::AwaitingOtp;
-                    self.snapshot.challenge = Some(method);
-                    self.snapshot.message = "Enter the temporary second password".into();
+                    if !self.cancel.load(Ordering::Relaxed)
+                        && self.snapshot.state != ConnectionState::Failed
+                    {
+                        self.snapshot.state = ConnectionState::AwaitingOtp;
+                        self.snapshot.challenge = Some(method);
+                        self.snapshot.message = "Enter the temporary second password".into();
+                    }
                 }
                 Event::Stats {
                     tx_bytes,
@@ -413,6 +449,7 @@ impl Controller {
                     self.snapshot.credentials_rejected = is_credentials_rejected(&message);
                     self.snapshot.authorization_failed = is_authorization_failed(&message);
                     self.snapshot.state = ConnectionState::Failed;
+                    self.snapshot.challenge = None;
                     self.snapshot.message = message.clone();
                     self.snapshot.logs.push(message);
                 }
@@ -1149,6 +1186,137 @@ pub fn foreground(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn synthetic_connected() -> Event {
+        Event::Connected {
+            interface: "synthetic-tun".into(),
+            address: "192.0.2.2".into(),
+            cipher: "synthetic cipher".into(),
+            transport: "synthetic transport".into(),
+        }
+    }
+
+    #[test]
+    fn cancelled_session_cannot_be_revived_by_queued_connection_or_challenge_events() {
+        let mut controller = Controller::new();
+        let events = controller.attach_test_session();
+        events
+            .send(Event::Challenge {
+                method: "sms".into(),
+            })
+            .unwrap();
+        controller.poll();
+        assert_eq!(controller.snapshot.state, ConnectionState::AwaitingOtp);
+        controller.disconnect();
+        assert_eq!(controller.snapshot.state, ConnectionState::Disconnecting);
+        assert!(controller.snapshot.challenge.is_none());
+        let cancellation_message = controller.snapshot.message.clone();
+        events.send(synthetic_connected()).unwrap();
+        events
+            .send(Event::Challenge {
+                method: "late sms".into(),
+            })
+            .unwrap();
+        events
+            .send(Event::Status {
+                message: "late connection progress".into(),
+            })
+            .unwrap();
+        controller.poll();
+        assert!(controller.is_busy());
+        assert_eq!(controller.snapshot.state, ConnectionState::Disconnecting);
+        assert_eq!(controller.snapshot.message, cancellation_message);
+        assert!(controller.snapshot.challenge.is_none());
+        // The interface can already exist when cancellation races the final
+        // handshake. Its ownership remains visible only until terminal cleanup.
+        assert_eq!(
+            controller.snapshot.interface.as_deref(),
+            Some("synthetic-tun")
+        );
+        events.send(Event::Disconnected).unwrap();
+        controller.poll();
+        assert!(!controller.is_busy());
+        assert_eq!(controller.snapshot.state, ConnectionState::Disconnected);
+        assert!(controller.snapshot.interface.is_none());
+        assert!(controller.snapshot.address.is_none());
+    }
+
+    #[test]
+    fn real_failure_survives_cancellation_late_progress_and_terminal_cleanup() {
+        let mut controller = Controller::new();
+        let events = controller.attach_test_session();
+        controller.disconnect();
+        let failure = "Synthetic route cleanup failed";
+        events
+            .send(Event::Error {
+                message: failure.into(),
+            })
+            .unwrap();
+        events.send(synthetic_connected()).unwrap();
+        events
+            .send(Event::Challenge {
+                method: "late sms".into(),
+            })
+            .unwrap();
+        events
+            .send(Event::Status {
+                message: "late progress".into(),
+            })
+            .unwrap();
+        controller.poll();
+        assert!(controller.is_busy());
+        assert_eq!(controller.snapshot.state, ConnectionState::Failed);
+        assert_eq!(controller.snapshot.message, failure);
+        assert!(controller.snapshot.challenge.is_none());
+        assert!(controller.snapshot.interface.is_none());
+        controller.disconnect();
+        assert_eq!(controller.snapshot.state, ConnectionState::Failed);
+        assert_eq!(controller.snapshot.message, failure);
+        events.send(Event::Disconnected).unwrap();
+        controller.poll();
+        assert!(!controller.is_busy());
+        assert_eq!(controller.snapshot.state, ConnectionState::Failed);
+        assert_eq!(controller.snapshot.message, failure);
+        assert!(controller.snapshot.logs.iter().any(|line| line == failure));
+    }
+
+    #[test]
+    fn error_before_terminal_preserves_diagnostics_and_next_session_has_fresh_cancellation() {
+        let mut controller = Controller::new();
+        let events = controller.attach_test_session();
+        events.send(synthetic_connected()).unwrap();
+        controller.poll();
+        let generation = controller.snapshot.session_generation;
+        events
+            .send(Event::Error {
+                message: "Synthetic gateway closed the session".into(),
+            })
+            .unwrap();
+        controller.poll();
+        assert_eq!(controller.snapshot.state, ConnectionState::Failed);
+        assert!(controller.is_busy());
+        controller.disconnect();
+        events.send(Event::Disconnected).unwrap();
+        events.send(Event::Disconnected).unwrap();
+        controller.poll();
+        assert!(!controller.is_busy());
+        assert_eq!(controller.snapshot.state, ConnectionState::Failed);
+        assert_eq!(
+            controller.snapshot.message,
+            "Synthetic gateway closed the session"
+        );
+        assert!(controller.snapshot.interface.is_none());
+        let next = controller.attach_test_session();
+        assert!(!controller.cancel.load(Ordering::Relaxed));
+        next.send(synthetic_connected()).unwrap();
+        controller.poll();
+        assert_eq!(controller.snapshot.state, ConnectionState::Connected);
+        assert!(controller.snapshot.session_generation > generation);
+        controller.disconnect();
+        next.send(Event::Disconnected).unwrap();
+        controller.poll();
+        assert!(!controller.is_busy());
+    }
 
     #[test]
     fn credential_rejection_does_not_include_transport_policy_or_otp_errors() {

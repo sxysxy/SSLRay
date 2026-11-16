@@ -2,9 +2,11 @@
 
 [English](README.md) | **简体中文**
 
-Rust 实现的 SSL VPN 桌面客户端，使用 egui 界面，支持多 Profile、系统托盘、后台运行、中英文和浅色/深色主题。0.1.0 各平台的实测范围见[验证记录](docs/VALIDATION.md)。
+Rust 实现的 SSL VPN 桌面客户端，使用 egui 界面，支持多 Profile、系统托盘、后台运行、中英文和浅色/深色主题。当前验证状态和历史验收范围见[验证记录](docs/VALIDATION.md)。
 
 项目采用 **GPL-3.0-or-later**，附带仅针对 Wintun 的[链接附加许可](LICENSE-WINTUN-EXCEPTION)。见 [LICENSE](LICENSE)、[COPYRIGHT](COPYRIGHT)；第三方组件保留[各自的许可声明](docs/THIRD-PARTY.md)。
+
+**0.2.0 变更：** 托盘状态随后台断线同步；已连接为绿色、未连接保留原蓝色，连接中、等待第二密码和断开中为琥珀色，失败为红色。提示文字跟随界面语言，“断开”仅在已连接时可用。三平台构建及回归检查已通过，实际运行范围见验证记录。
 
 | 协议 | 实现范围 | 已验证环境 |
 | --- | --- | --- |

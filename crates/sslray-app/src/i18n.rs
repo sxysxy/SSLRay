@@ -264,6 +264,8 @@ catalog! {
     TrayHide => ("隐藏窗口", "Hide window"),
     TrayQuit => ("退出 SSLRay", "Quit SSLRay"),
     TrayCreateFailed => ("无法创建系统托盘", "Unable to create system tray"),
+    TrayUpdateFailed => ("托盘状态更新失败", "Could not update system tray status"),
+    TrayDisconnected => ("未连接", "Disconnected"),
     InvalidConfigDirectory => ("应用配置目录无效", "Invalid configuration directory"),
     InvalidGatewayHost => ("网关地址为空或长度超过限制", "Invalid gateway host"),
     GatewayHostnameRequired => ("网关必须是主机名或 IP 地址", "Gateway must be a hostname or IP address"),

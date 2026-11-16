@@ -435,9 +435,7 @@ impl App {
                 });
         });
         if self.language != previous {
-            if let Some(tray) = &mut self.tray {
-                tray.set_language(self.language);
-            }
+            self.sync_tray_status();
             if let Err(error) = self.save_preferences() {
                 self.notice = Some(Notice::error(T::UiPrefsFailed, error));
             }
@@ -2189,8 +2187,34 @@ impl App {
     }
 }
 
-impl eframe::App for App {
-    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+impl App {
+    fn sync_tray_status(&mut self) {
+        if let Some(tray) = &mut self.tray
+            && let Err(error) =
+                tray.set_status(self.controller.snapshot().state.clone(), self.language)
+        {
+            self.notice = Some(Notice::error(T::TrayUpdateFailed, error));
+        }
+    }
+
+    fn handle_tray_action(&mut self, ctx: &egui::Context, action: tray::Action) {
+        match action {
+            tray::Action::Show => self.show(ctx),
+            tray::Action::Hide => self.hide(ctx),
+            // A menu click may already be queued when the worker reports a
+            // disconnect. Do not let it overwrite a failure or cancel a later
+            // handshake after this menu item has become disabled.
+            tray::Action::Disconnect => {
+                if self.controller.snapshot().state == ConnectionState::Connected && self.busy() {
+                    self.clear_certificate_check();
+                    self.controller.disconnect();
+                }
+            }
+            tray::Action::Quit => self.quit(ctx),
+        }
+    }
+
+    fn background_tick(&mut self, ctx: &egui::Context) {
         self.controller.poll();
         self.poll_certificate_check(ctx);
         if self.controller.snapshot().state == ConnectionState::Connected {
@@ -2267,15 +2291,7 @@ impl eframe::App for App {
             .map(|tray| tray.actions.try_iter().collect())
             .unwrap_or_default();
         for action in actions {
-            match action {
-                tray::Action::Show => self.show(ctx),
-                tray::Action::Hide => self.hide(ctx),
-                tray::Action::Disconnect => {
-                    self.clear_certificate_check();
-                    self.controller.disconnect();
-                }
-                tray::Action::Quit => self.quit(ctx),
-            }
+            self.handle_tray_action(ctx, action);
         }
         if ctx.input(|input| input.viewport().close_requested()) && !self.quitting {
             if self.tray.is_some() {
@@ -2286,6 +2302,9 @@ impl eframe::App for App {
                 self.controller.disconnect();
             }
         }
+        // Sync after polling and dispatching actions, including while the window
+        // is hidden. Painting the main window must not be required for the tray.
+        self.sync_tray_status();
         // egui 0.35 calls logic while hidden, so background status and tray events remain live.
         ctx.request_repaint_after(Duration::from_millis(
             if self.busy() || self.certificate_query.is_some() {
@@ -2294,6 +2313,12 @@ impl eframe::App for App {
                 800
             },
         ));
+    }
+}
+
+impl eframe::App for App {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.background_tick(ctx);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -3262,6 +3287,84 @@ mod tests {
     impl Drop for TestApp {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(self.0.config_dir.as_ref().unwrap());
+        }
+    }
+
+    fn connected_test_event() -> sslray_core::session::Event {
+        sslray_core::session::Event::Connected {
+            // No real adapter lookup, network access or privilege request.
+            interface: String::new(),
+            address: "192.0.2.2".into(),
+            cipher: "test".into(),
+            transport: "TLS".into(),
+        }
+    }
+
+    #[test]
+    fn hidden_background_tick_observes_disconnect_and_rejects_stale_tray_clicks() {
+        use sslray_core::session::Event;
+
+        for failed in [false, true] {
+            let mut fixture = TestApp::new();
+            let app = &mut fixture.0;
+            let ctx = egui::Context::default();
+            app.hidden = true;
+            let tx = app.controller.attach_test_session();
+            tx.send(connected_test_event()).unwrap();
+            app.background_tick(&ctx);
+            assert_eq!(app.controller.snapshot().state, ConnectionState::Connected);
+            assert!(app.hidden);
+
+            if failed {
+                tx.send(Event::Error {
+                    message: "VPN transport closed unexpectedly".into(),
+                })
+                .unwrap();
+                app.background_tick(&ctx);
+                assert_eq!(app.controller.snapshot().state, ConnectionState::Failed);
+                assert!(app.busy()); // Cleanup has not finished yet.
+                let message = app.controller.snapshot().message.clone();
+                app.handle_tray_action(&ctx, tray::Action::Disconnect);
+                assert_eq!(app.controller.snapshot().state, ConnectionState::Failed);
+                assert_eq!(app.controller.snapshot().message, message);
+            }
+
+            tx.send(Event::Disconnected).unwrap();
+            app.background_tick(&ctx);
+            assert!(!app.busy());
+            assert!(app.hidden); // No main-window render is needed to process it.
+            let terminal = app.controller.snapshot().state.clone();
+            assert_eq!(
+                terminal,
+                if failed {
+                    ConnectionState::Failed
+                } else {
+                    ConnectionState::Disconnected
+                }
+            );
+            let message = app.controller.snapshot().message.clone();
+            app.handle_tray_action(&ctx, tray::Action::Disconnect);
+            assert_eq!(app.controller.snapshot().state, terminal);
+            assert_eq!(app.controller.snapshot().message, message);
+
+            // A new active connection can still be disconnected from the tray.
+            let tx = app.controller.attach_test_session();
+            app.handle_tray_action(&ctx, tray::Action::Disconnect);
+            assert_eq!(app.controller.snapshot().state, ConnectionState::Connecting);
+            tx.send(connected_test_event()).unwrap();
+            app.background_tick(&ctx);
+            app.handle_tray_action(&ctx, tray::Action::Disconnect);
+            assert_eq!(
+                app.controller.snapshot().state,
+                ConnectionState::Disconnecting
+            );
+            tx.send(Event::Disconnected).unwrap();
+            app.background_tick(&ctx);
+            assert_eq!(
+                app.controller.snapshot().state,
+                ConnectionState::Disconnected
+            );
+            assert!(app.hidden);
         }
     }
 
