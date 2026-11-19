@@ -334,6 +334,9 @@ pub(super) struct LegacyChannel {
     pending_tls_controls: u8,
 }
 impl LegacyChannel {
+    pub(super) fn uses_udp(&self) -> bool {
+        self.udp.is_some()
+    }
     pub fn send_packet(&mut self, packet: &[u8]) -> Result<()> {
         ensure!(valid_ipv4(packet), "Malformed legacy outgoing IPv4 packet");
         if let Some(udp) = &mut self.udp {
@@ -702,5 +705,106 @@ mod tests {
         write_frame(&mut other_command.buffered, 42, 3, &[0; 20]).unwrap();
         other_command.buffered[14..16].copy_from_slice(&[20, 0]);
         assert_eq!(other_command.payload_length(), 5120);
+    }
+
+    #[test]
+    fn source_requirement_follows_live_legacy_udp_not_transport_labels_or_profile() {
+        use crate::backend::{BackendConnection, PacketBackend};
+        use openssl::ssl::{Ssl, SslContextBuilder, SslMethod};
+        use std::net::{TcpListener, TcpStream, UdpSocket};
+
+        struct IdleBackend;
+        impl PacketBackend for IdleBackend {
+            fn send_packet(&mut self, _: &[u8]) -> Result<()> {
+                Ok(())
+            }
+            fn read_packet(&mut self) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn set_read_budget(&self, _: Duration) -> Result<()> {
+                Ok(())
+            }
+            fn keepalive(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn outer_ipv4_addresses(&self) -> Result<Vec<Ipv4Addr>> {
+                Ok(vec![])
+            }
+            fn disconnect(&mut self) {}
+            fn close(&mut self) {}
+        }
+        fn unstarted_local_tls() -> TlsStream {
+            // Establish a plain loopback socket without TLS/application writes.
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let socket = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let _peer = listener.accept().unwrap();
+            let context = SslContextBuilder::new(SslMethod::tls_client())
+                .unwrap()
+                .build();
+            #[cfg(windows)]
+            let socket = crate::crypto::TlsSocket::from(socket);
+            TlsStream::new(Ssl::new(&context).unwrap(), socket).unwrap()
+        }
+        let vip = Ipv4Addr::new(192, 0, 2, 2);
+        let mut gateway = Gateway::from_backend(BackendConnection {
+            vip,
+            routes: vec![],
+            dns: vec![],
+            cipher: "fixture".into(),
+            transport: "UDP (OpenVPN)".into(),
+            negotiated_mtu: None,
+            channel: Box::new(IdleBackend),
+        })
+        .unwrap();
+        // External/OpenVPN keeps its backend policy, even with a legacy label.
+        assert!(!gateway.requires_assigned_ipv4_source());
+        gateway.transport = "UDP/AES-128-CBC (legacy, unauthenticated)".into();
+        assert!(!gateway.requires_assigned_ipv4_source());
+        gateway.data = DataChannel::Tls {
+            stream: unstarted_local_tls(),
+            decoder: Decoder::default(),
+        };
+        assert!(!gateway.requires_assigned_ipv4_source());
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        gateway.data = DataChannel::Udp(
+            super::super::udp::UdpChannel::connect(
+                peer.local_addr().unwrap(),
+                vip,
+                Zeroizing::new(vec![3; 32]),
+            )
+            .unwrap(),
+        );
+        assert!(!gateway.requires_assigned_ipv4_source());
+
+        let now = Instant::now();
+        gateway.data = DataChannel::Legacy(Box::new(LegacyChannel {
+            stream: unstarted_local_tls(),
+            decoder: LegacyDecoder::default(),
+            user_id: 42,
+            auth: None,
+            profile: Profile {
+                transport: TransportMode::Udp,
+                ..Profile::default()
+            },
+            disconnected: false,
+            last_keepalive: now,
+            last_control_read: now,
+            udp: None,
+            pending_tls_controls: 0,
+        }));
+        // Legacy TLS/fallback does not require filtering even if profile says UDP.
+        assert!(!gateway.requires_assigned_ipv4_source());
+        gateway.transport = "TLS/TCP".into();
+        if let DataChannel::Legacy(channel) = &mut gateway.data {
+            channel.udp = Some(
+                udp::LegacyUdp::new(peer.local_addr().unwrap(), vip, 42, Zeroizing::new([3; 16]))
+                    .unwrap(),
+            );
+        }
+        assert!(gateway.requires_assigned_ipv4_source());
+        if let DataChannel::Legacy(channel) = &mut gateway.data {
+            channel.udp = None;
+        }
+        assert!(!gateway.requires_assigned_ipv4_source());
     }
 }

@@ -387,12 +387,17 @@ mod tests {
     struct BundleFixture(PathBuf);
     impl BundleFixture {
         fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let unique = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            let directory = std::env::temp_dir()
-                .join(format!("sslray-ca-bundle-{}-{unique}", std::process::id()));
+            // Parallel tests can observe the same wall-clock timestamp.
+            let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let directory = std::env::temp_dir().join(format!(
+                "sslray-ca-bundle-{}-{unique}-{sequence}",
+                std::process::id()
+            ));
             std::fs::create_dir(&directory).unwrap();
             Self(directory)
         }

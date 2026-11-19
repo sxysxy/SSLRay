@@ -215,7 +215,7 @@ fn tlvs(mut bytes: &[u8]) -> Result<Vec<(u16, &[u8])>> {
     }
     Ok(result)
 }
-fn valid_ipv4(packet: &[u8]) -> bool {
+pub(crate) fn valid_ipv4(packet: &[u8]) -> bool {
     if packet.len() < 20 || packet[0] >> 4 != 4 {
         return false;
     }
@@ -701,6 +701,11 @@ impl Gateway {
                 .map(|c| c.name())
                 .unwrap_or("unknown")
         ))
+    }
+    /// Apply the local-source prefilter only to the active legacy CHIV channel.
+    /// Leave source-policy enforcement for every other backend unchanged.
+    pub(crate) fn requires_assigned_ipv4_source(&self) -> bool {
+        matches!(&self.data, DataChannel::Legacy(channel) if channel.uses_udp())
     }
     pub fn send_packet(&mut self, packet: &[u8]) -> Result<()> {
         ensure!(

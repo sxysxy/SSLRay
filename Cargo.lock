@@ -3552,7 +3552,7 @@ dependencies = [
 
 [[package]]
 name = "sslray"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -3576,7 +3576,7 @@ dependencies = [
 
 [[package]]
 name = "sslray-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",

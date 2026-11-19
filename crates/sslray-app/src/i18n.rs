@@ -299,6 +299,8 @@ catalog! {
     StatusLegacyFallback => ("兼容 UDP 不可用，正在切回 TLS", "Compatible UDP unavailable; returning to TLS"),
     StatusLegacyTls => ("已选择 TLS 传输", "TLS transport selected"),
     StatusGmTlsOnly => ("国密策略使用 TLS 传输", "GM policy uses TLS transport"),
+    StatusLocalSourceDrops => ("已丢弃源地址与 VPN 分配地址不符的本机 IPv4 数据包（累计 {total} 个）。原有应用连接可能需要刷新。", "Dropped local IPv4 packets whose source differs from the assigned VPN address (total {total}). Existing application connections may need to be refreshed."),
+    LocalSourceMismatch => ("数据包源地址与 VPN 分配地址不符，请刷新原有应用连接后重试。", "The packet source differs from the assigned VPN address. Refresh existing application connections and try again."),
 }
 
 /// Localize messages emitted by our core/runtime while preserving unknown server
@@ -317,6 +319,10 @@ pub fn known_diagnostic(language: Language, message: &str) -> Option<Cow<'_, str
         "Huawei legacy UDP unavailable; switching to TLS" => Some(Text::StatusLegacyFallback),
         "Huawei legacy TLS selected" => Some(Text::StatusLegacyTls),
         "GM TLS policy excludes legacy UDP" => Some(Text::StatusGmTlsOnly),
+        "Legacy UDP source differs from assigned IPv4"
+        | "Cisco outgoing IPv4 source differs from assigned address" => {
+            Some(Text::LocalSourceMismatch)
+        }
         "Strict GM TLS mode cannot use AES UDP transport; select TLS or Auto" => {
             Some(Text::GmTransportHelp)
         }
@@ -371,6 +377,23 @@ pub fn known_diagnostic(language: Language, message: &str) -> Option<Cow<'_, str
     };
     if let Some(id) = id {
         return Some(Cow::Borrowed(text(language, id)));
+    }
+    // Core formats this status with a canonical u64. Reject signs, leading
+    // zeroes, overflow and surrounding server text rather than matching words.
+    if let Some(total) = message
+        .strip_prefix("Dropped local IPv4 packets outside the assigned VPN source address (total ")
+        .and_then(|value| value.strip_suffix(')'))
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= 20
+                && value.bytes().all(|byte| byte.is_ascii_digit())
+                && (value.len() == 1 || !value.starts_with('0'))
+        })
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        return Some(Cow::Owned(
+            text(language, Text::StatusLocalSourceDrops).replace("{total}", &total.to_string()),
+        ));
     }
     for (prefix, id) in [
         ("Connected over ", Text::StatusConnectedOver),
@@ -441,6 +464,82 @@ mod tests {
                 Some(text(language, Text::StatusAuthenticating))
             );
             assert!(known_diagnostic(language, "server error 0x42").is_none());
+        }
+    }
+
+    #[test]
+    fn local_source_drop_status_keeps_the_count_and_existing_connection_advice() {
+        let raw = "Dropped local IPv4 packets outside the assigned VPN source address (total 1003)";
+        assert_eq!(
+            known_diagnostic(Language::ZhCn, raw).as_deref(),
+            Some(
+                "已丢弃源地址与 VPN 分配地址不符的本机 IPv4 数据包（累计 1003 个）。原有应用连接可能需要刷新。"
+            )
+        );
+        assert_eq!(
+            known_diagnostic(Language::En, raw).as_deref(),
+            Some(
+                "Dropped local IPv4 packets whose source differs from the assigned VPN address (total 1003). Existing application connections may need to be refreshed."
+            )
+        );
+        for total in [0, 1, u64::MAX] {
+            let raw = format!(
+                "Dropped local IPv4 packets outside the assigned VPN source address (total {total})"
+            );
+            for language in [Language::ZhCn, Language::En] {
+                let translated = known_diagnostic(language, &raw).unwrap();
+                assert!(translated.contains(&total.to_string()));
+                assert!(!translated.contains("{total}"));
+            }
+        }
+    }
+
+    #[test]
+    fn local_source_drop_status_rejects_malformed_or_embedded_counts() {
+        let prefix = "Dropped local IPv4 packets outside the assigned VPN source address (total ";
+        let mut malformed = vec![
+            format!("server says {prefix}1)"),
+            format!("{prefix}1) extra"),
+            format!("{prefix}1)\n"),
+            format!("{prefix}1"),
+        ];
+        for count in [
+            "",
+            "-1",
+            "+1",
+            "01",
+            "00",
+            "1.0",
+            "1e3",
+            " 1",
+            "1 ",
+            "١",
+            "18446744073709551616",
+            "password=synthetic-secret",
+        ] {
+            malformed.push(format!("{prefix}{count})"));
+        }
+        for raw in malformed {
+            for language in [Language::ZhCn, Language::En] {
+                assert!(known_diagnostic(language, &raw).is_none(), "{raw}");
+                assert_eq!(diagnostic(language, &raw).as_ref(), raw.as_str());
+            }
+        }
+    }
+
+    #[test]
+    fn local_source_errors_are_recognized_only_as_exact_local_messages() {
+        for raw in [
+            "Legacy UDP source differs from assigned IPv4",
+            "Cisco outgoing IPv4 source differs from assigned address",
+        ] {
+            for language in [Language::ZhCn, Language::En] {
+                assert_eq!(
+                    known_diagnostic(language, raw).as_deref(),
+                    Some(text(language, Text::LocalSourceMismatch))
+                );
+                assert!(known_diagnostic(language, &format!("server says {raw}")).is_none());
+            }
         }
     }
 }
